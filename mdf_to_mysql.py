@@ -494,6 +494,111 @@ def _topo_sort_views(views: dict) -> list:
     return sorted_list
 
 
+def _paren_close(sql: str, open_pos: int) -> int:
+    """Gibt den Index der schliessenden ')' zurück die zu '(' an open_pos gehört."""
+    depth = 1
+    i = open_pos + 1
+    while i < len(sql) and depth > 0:
+        if sql[i] == '(':
+            depth += 1
+        elif sql[i] == ')':
+            depth -= 1
+        i += 1
+    return i - 1   # Position der schliessenden ')'
+
+
+def _convert_apply_to_join(sql: str) -> str:
+    """Konvertiert OUTER/CROSS APPLY zu LEFT JOIN / JOIN mit gruppierter Subquery.
+
+    OUTER APPLY → LEFT JOIN (subquery mit GROUP BY) ON join_condition
+    CROSS APPLY → JOIN      (subquery mit GROUP BY) ON join_condition
+
+    Das vermeidet LATERAL, das auf manchen MariaDB-Builds nicht verfügbar ist.
+    Algorithmus:
+      1. Subquery-Body per Klammern-Zählung extrahieren
+      2. WHERE-Bedingungen die outer-Tabellen referenzieren als korreliert erkennen
+      3. Korrelierte Spalten in SELECT + GROUP BY der Subquery einfügen
+      4. JOIN ON aus den korrelierten Bedingungen bauen
+    """
+    apply_re = re.compile(r'\b(OUTER|CROSS)\s+APPLY\s*\(', re.IGNORECASE)
+    result: List[str] = []
+    pos = 0
+
+    for m in apply_re.finditer(sql):
+        join_kw = 'LEFT JOIN' if m.group(1).upper() == 'OUTER' else 'JOIN'
+        result.append(sql[pos:m.start()])
+
+        open_pos  = m.end() - 1           # Position der öffnenden '('
+        close_pos = _paren_close(sql, open_pos)
+        body      = sql[m.end():close_pos]   # Inhalt ohne äussere Klammern
+
+        # Alias nach der schliessenden ')'
+        after = sql[close_pos + 1:]
+        alias_m = re.match(r'\s+(?:AS\s+)?(`?\w+`?)', after, re.IGNORECASE)
+        alias     = alias_m.group(1) if alias_m else 'subq'
+        alias_end = close_pos + 1 + (len(alias_m.group(0)) if alias_m else 0)
+
+        # ── Subquery parsen: SELECT … FROM … WHERE … ──────────────────────
+        from_m  = re.search(r'\bFROM\b',  body, re.IGNORECASE)
+        where_m = re.search(r'\bWHERE\b', body, re.IGNORECASE)
+
+        if from_m and where_m:
+            select_part = body[:from_m.start()].strip()          # 'SELECT col1, col2'
+            from_part   = body[from_m.end():where_m.start()].strip()
+            where_part  = body[where_m.end():].strip()
+
+            # Inner-Tabellen-Alias ermitteln (letztes Wort im FROM-Ausdruck)
+            inner_alias_m = re.search(r'(?:AS\s+)?(`?\w+`?)\s*$', from_part, re.IGNORECASE)
+            inner_alias   = inner_alias_m.group(1).strip('`') if inner_alias_m else ''
+
+            # WHERE-Bedingungen auf AND aufteilen
+            conditions = re.split(r'\bAND\b', where_part, flags=re.IGNORECASE)
+            correlated: List[str] = []   # inner.col = outer.col
+            remaining:  List[str] = []   # alle anderen
+
+            for cond in conditions:
+                c = cond.strip()
+                # Muster: tabellenalias.spalte = tabellenalias.spalte
+                eq = re.match(
+                    r'(`?\w+`?)\.(`?\w+`?)\s*=\s*(`?\w+`?)\.(`?\w+`?)',
+                    c, re.IGNORECASE
+                )
+                if eq:
+                    l_tbl, l_col, r_tbl, r_col = [g.strip('`') for g in eq.groups()]
+                    if l_tbl.lower() == inner_alias.lower():
+                        correlated.append((l_col, f'{r_tbl}.{r_col}'))
+                        continue
+                    elif r_tbl.lower() == inner_alias.lower():
+                        correlated.append((r_col, f'{l_tbl}.{l_col}'))
+                        continue
+                remaining.append(c)
+
+            if correlated:
+                # Korrelierte Spalten in SELECT und GROUP BY einfügen
+                extra_sel  = ', '.join(f'{inner_alias}.{c[0]}' for c in correlated)
+                new_select = select_part + ', ' + extra_sel   # 'SELECT aggs, key1, key2'
+                group_by   = ', '.join(f'{inner_alias}.{c[0]}' for c in correlated)
+                on_cond    = ' AND '.join(
+                    f'{alias}.{c[0]} = {c[1]}' for c in correlated
+                )
+
+                new_body  = f'{new_select}\n    FROM {from_part}'
+                if remaining:
+                    new_body += '\n    WHERE ' + ' AND '.join(remaining)
+                new_body += f'\n    GROUP BY {group_by}'
+
+                result.append(f'{join_kw} (\n    {new_body}\n) AS {alias} ON {on_cond}')
+                pos = alias_end
+                continue
+
+        # Fallback: unveränderter Body (kann nicht automatisch konvertiert werden)
+        result.append(f'{join_kw} ({body}) AS {alias}')
+        pos = alias_end
+
+    result.append(sql[pos:])
+    return ''.join(result)
+
+
 def convert_view_sql(tsql: str) -> tuple:
     """T-SQL → MySQL Konvertierung für View-Definitionen.
     Gibt (sql, warnings) zurück – warnings ist eine Liste von Strings
@@ -590,40 +695,11 @@ def convert_view_sql(tsql: str) -> tuple:
         flags=re.IGNORECASE | re.DOTALL,
     )
 
-    # ── OUTER APPLY → LEFT JOIN LATERAL (...) ON TRUE ────────────────────
-    # T-SQL:  OUTER APPLY (subquery) alias
-    # MySQL:  LEFT JOIN LATERAL (subquery) alias ON TRUE
-    sql = re.sub(
-        r'\bOUTER\s+APPLY\s*\(',
-        'LEFT JOIN LATERAL (',
-        sql,
-        flags=re.IGNORECASE,
-    )
-    # Alias nach der schließenden Klammer braucht kein ON TRUE – das fügen wir
-    # hinter dem Alias ein. Da wir den Alias nicht kennen, ergänzen wir ON TRUE
-    # nach dem Alias-Token mit einem zweiten Pass.
-    sql = re.sub(
-        r'(LEFT\s+JOIN\s+LATERAL\s*\(.*?\)\s*)(\w+)(?!\s+ON\b)',
-        r'\1\2 ON TRUE',
-        sql,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-
-    # ── CROSS APPLY → JOIN LATERAL (...) ON TRUE ─────────────────────────
-    # T-SQL:  CROSS APPLY (subquery) alias
-    # MySQL:  JOIN LATERAL (subquery) alias ON TRUE
-    sql = re.sub(
-        r'\bCROSS\s+APPLY\s*\(',
-        'JOIN LATERAL (',
-        sql,
-        flags=re.IGNORECASE,
-    )
-    sql = re.sub(
-        r'((?<!LEFT\s)JOIN\s+LATERAL\s*\(.*?\)\s*)(\w+)(?!\s+ON\b)',
-        r'\1\2 ON TRUE',
-        sql,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
+    # ── OUTER APPLY → LEFT JOIN (grouped subquery) ON condition ─────────
+    # ── CROSS APPLY → JOIN      (grouped subquery) ON condition ──────────
+    # LATERAL funktioniert nicht auf allen MariaDB-Builds →
+    # _convert_apply_to_join() baut klassische GROUP BY-Subqueries.
+    sql = _convert_apply_to_join(sql)
 
     # Doppelte Leerzeilen bereinigen
     sql = re.sub(r'\n{3,}', '\n\n', sql)
