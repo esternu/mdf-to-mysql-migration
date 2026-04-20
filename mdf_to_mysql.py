@@ -142,6 +142,19 @@ def _build_conn_str(driver: str, database: Optional[str] = None) -> str:
         parts.append(f"DATABASE={database}")
     return ";".join(parts) + ";"
 
+def _find_ldf(mdf_path: str) -> Optional[str]:
+    """Sucht die passende .ldf-Datei zur .mdf-Datei.
+    SQL Server benennt Log-Dateien als '<Name>_log.ldf' oder '<Name>.ldf'."""
+    base = os.path.splitext(mdf_path)[0]
+    for candidate in [base + "_log.ldf", base + ".ldf"]:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+def _win_path(path: str) -> str:
+    """Konvertiert Pfad-Separatoren zu Windows-Backslashes (SQL Server-Anforderung)."""
+    return os.path.normpath(path).replace("/", "\\")
+
 def attach_mdf(mdf_path: str, db_name: str, driver: str, log) -> "pyodbc.Connection":
     """Hängt die .mdf-Datei an LocalDB / SQL Server an und gibt eine Verbindung zurück."""
     log(f"Verbinde mit LocalDB via Treiber: {driver}")
@@ -163,12 +176,34 @@ def attach_mdf(mdf_path: str, db_name: str, driver: str, log) -> "pyodbc.Connect
     # Prüfen ob DB bereits angehängt
     cur.execute("SELECT name FROM sys.databases WHERE name = ?", db_name)
     if not cur.fetchone():
-        log(f"Hänge {mdf_path} als [{db_name}] an …")
-        mdf_path_escaped = mdf_path.replace("'", "''")
-        cur.execute(
-            f"CREATE DATABASE [{db_name}] ON (FILENAME='{mdf_path_escaped}') FOR ATTACH_REBUILD_LOG"
-        )
-        log("Datenbank angehängt.")
+        # Pfade normalisieren: Forward-Slashes → Backslashes (SQL Server-Pflicht)
+        mdf_win  = _win_path(mdf_path).replace("'", "''")
+        ldf_path = _find_ldf(mdf_path)
+
+        if ldf_path:
+            # LDF gefunden → FOR ATTACH mit beiden Dateien (zuverlässiger)
+            ldf_win = _win_path(ldf_path).replace("'", "''")
+            log(f"LDF gefunden: {ldf_win}")
+            log(f"Hänge [{db_name}] an (MDF + LDF) …")
+            sql = (
+                f"CREATE DATABASE [{db_name}] ON "
+                f"(FILENAME='{mdf_win}'), "
+                f"(FILENAME='{ldf_win}') "
+                f"FOR ATTACH"
+            )
+        else:
+            # Kein LDF → Log-Datei neu erstellen lassen
+            log(f"Kein LDF gefunden – Log wird neu erstellt.")
+            log(f"Hänge [{db_name}] an (nur MDF) …")
+            sql = (
+                f"CREATE DATABASE [{db_name}] ON "
+                f"(FILENAME='{mdf_win}') "
+                f"FOR ATTACH_REBUILD_LOG"
+            )
+
+        log(f"SQL: {sql}")
+        cur.execute(sql)
+        log("Datenbank erfolgreich angehängt.")
     else:
         log(f"Datenbank [{db_name}] bereits vorhanden, verwende vorhandene.")
 
