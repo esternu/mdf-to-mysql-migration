@@ -75,10 +75,20 @@ TYPE_MAP = {
 def convert_type(sql_type: str, max_len, precision, scale) -> str:
     base = sql_type.lower().strip()
     mysql = TYPE_MAP.get(base, sql_type.upper())
-    # Länge/Präzision anhängen wenn sinnvoll
-    if mysql in ("VARCHAR", "CHAR") and max_len:
-        size = min(int(max_len), 65535) if int(max_len) != -1 else 65535
-        return f"{mysql}({size})"
+
+    if mysql in ("VARCHAR", "CHAR") and max_len is not None:
+        ml = int(max_len)
+        if ml == -1:
+            # NVARCHAR(MAX) / VARCHAR(MAX) → kein VARCHAR-Limit möglich
+            return "LONGTEXT"
+        # utf8mb4: max. 4 Bytes/Zeichen → VARCHAR-Limit = 16383 Zeichen
+        # Darüber: TEXT (bis ~65K Zeichen), MEDIUMTEXT (bis ~16M), LONGTEXT (bis ~4G)
+        if mysql == "CHAR":
+            return f"CHAR({min(ml, 255)})"   # CHAR-Limit ist 255
+        if ml > 16383:
+            return "TEXT" if ml <= 65535 else "MEDIUMTEXT"
+        return f"VARCHAR({ml})"
+
     if mysql == "DECIMAL" and precision:
         sc = scale or 0
         return f"DECIMAL({precision},{sc})"
