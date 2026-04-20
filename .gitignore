@@ -11,6 +11,9 @@ build/
 venv/
 .venv/
 
+# Konfiguration mit Zugangsdaten – niemals committen!
+config.json
+
 # SQL / Datenbank-Dateien (kein Commit von sensiblen Daten!)
 *.mdf
 *.ldf

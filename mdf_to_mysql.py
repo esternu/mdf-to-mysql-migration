@@ -17,12 +17,15 @@ import threading
 import re
 import os
 import sys
+import json
+import base64
 import datetime
 import subprocess as _subprocess
 from typing import Optional, List, Dict, Any
 
-# Log-Datei neben dem Skript ablegen
+# Pfade neben dem Skript
 _LOG_DIR  = os.path.dirname(os.path.abspath(__file__))
+_CFG_FILE = os.path.join(_LOG_DIR, "config.json")
 _LOG_FILE = os.path.join(
     _LOG_DIR,
     f"migration_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -465,6 +468,7 @@ class App(tk.Tk):
         self.geometry("820x700")
         self.resizable(True, True)
         self._build_ui()
+        self._load_config()   # gespeicherte Eingaben wiederherstellen
         self._check_deps()
 
     # ── UI-Aufbau ────────────────────────────────────────────────────────
@@ -489,13 +493,33 @@ class App(tk.Tk):
 
         # Aktions-Buttons unten
         btn_frame = ttk.Frame(self)
-        btn_frame.pack(fill="x", padx=8, pady=(0, 8))
+        btn_frame.pack(fill="x", padx=8, pady=(0, 4))
 
-        ttk.Button(btn_frame, text="Schema lesen",       command=self._read_schema).pack(side="left", padx=4)
-        ttk.Button(btn_frame, text="DDL generieren",     command=self._generate_ddl).pack(side="left", padx=4)
-        ttk.Button(btn_frame, text="DDL speichern …",    command=self._save_ddl).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Schema lesen",         command=self._read_schema).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="DDL generieren",       command=self._generate_ddl).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="DDL speichern …",      command=self._save_ddl).pack(side="left", padx=4)
         ttk.Button(btn_frame, text="▶ Auf MySQL deployen", command=self._deploy).pack(side="left", padx=4)
-        ttk.Button(btn_frame, text="Abhängigkeiten prüfen", command=self._check_deps).pack(side="right", padx=4)
+        ttk.Button(btn_frame, text="Abhängigkeiten prüfen",command=self._check_deps).pack(side="right", padx=4)
+
+        # Konfig-Leiste
+        cfg_frame = ttk.Frame(self)
+        cfg_frame.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Label(cfg_frame, text="Konfiguration:").pack(side="left", padx=(4, 8))
+
+        # Profil-Name
+        ttk.Label(cfg_frame, text="Profil:").pack(side="left")
+        self._profile_var = tk.StringVar(value="Standard")
+        self._profile_combo = ttk.Combobox(cfg_frame, textvariable=self._profile_var, width=18)
+        self._profile_combo.pack(side="left", padx=4)
+
+        ttk.Button(cfg_frame, text="💾  Speichern", command=self._save_config).pack(side="left", padx=4)
+        ttk.Button(cfg_frame, text="📂  Laden",     command=self._load_config).pack(side="left", padx=4)
+        ttk.Button(cfg_frame, text="🗑  Löschen",   command=self._delete_profile).pack(side="left", padx=4)
+
+        self._cfg_status = ttk.Label(cfg_frame, text="", foreground="#555")
+        self._cfg_status.pack(side="left", padx=8)
+
+        self._refresh_profiles()
 
     def _build_source_tab(self):
         f = self.tab_src
@@ -797,6 +821,122 @@ class App(tk.Tk):
                 messagebox.showerror("Fehler", str(e))
 
         threading.Thread(target=task, daemon=True).start()
+
+    # ── Konfiguration ────────────────────────────────────────────────────
+    def _all_profiles(self) -> dict:
+        """Liest alle Profile aus config.json. Gibt leeres Dict zurück falls nicht vorhanden."""
+        if os.path.isfile(_CFG_FILE):
+            try:
+                with open(_CFG_FILE, "r", encoding="utf-8") as fh:
+                    return json.load(fh)
+            except Exception:
+                pass
+        return {}
+
+    def _refresh_profiles(self):
+        """Aktualisiert die Profil-Auswahlliste."""
+        profiles = list(self._all_profiles().keys())
+        self._profile_combo["values"] = profiles or ["Standard"]
+        if not self._profile_var.get() and profiles:
+            self._profile_var.set(profiles[0])
+
+    def _save_config(self):
+        """Speichert alle Eingabefelder unter dem gewählten Profilnamen."""
+        profile = self._profile_var.get().strip() or "Standard"
+
+        # Passwort minimal verschleiern (kein Klartext in JSON)
+        pw_obf = base64.b64encode(self.mysql_pass.get().encode()).decode()
+
+        data = {
+            "mdf_path":       self.mdf_path.get(),
+            "db_attach_name": self.db_attach_name.get(),
+            "driver":         self.driver_var.get(),
+            "mysql_host":     self.mysql_host.get(),
+            "mysql_port":     self.mysql_port.get(),
+            "mysql_user":     self.mysql_user.get(),
+            "mysql_pass_b64": pw_obf,
+            "mysql_db":       self.mysql_db.get(),
+            "saved_at":       datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        all_cfg = self._all_profiles()
+        all_cfg[profile] = data
+
+        with open(_CFG_FILE, "w", encoding="utf-8") as fh:
+            json.dump(all_cfg, fh, ensure_ascii=False, indent=2)
+
+        self._refresh_profiles()
+        self._profile_var.set(profile)
+        msg = f"✓ Profil '{profile}' gespeichert."
+        self._cfg_status.config(text=msg, foreground="#006600")
+        self.log(msg)
+        self.after(3000, lambda: self._cfg_status.config(text=""))
+
+    def _load_config(self, profile: Optional[str] = None):
+        """Lädt ein Profil und füllt alle Felder. Ohne Argument: zuletzt genutztes Profil."""
+        all_cfg = self._all_profiles()
+        if not all_cfg:
+            return
+
+        if profile is None:
+            # Beim Start: Profil aus config.json laden das zuletzt gespeichert wurde
+            profile = self._profile_var.get().strip()
+            if profile not in all_cfg:
+                profile = next(iter(all_cfg))   # erstes verfügbares
+
+        if profile not in all_cfg:
+            self.log(f"⚠ Profil '{profile}' nicht gefunden.")
+            return
+
+        d = all_cfg[profile]
+
+        self.mdf_path.set(       d.get("mdf_path",       ""))
+        self.db_attach_name.set( d.get("db_attach_name", "MigratedDB"))
+        self.mysql_host.set(     d.get("mysql_host",     ""))
+        self.mysql_port.set(     d.get("mysql_port",     "3306"))
+        self.mysql_user.set(     d.get("mysql_user",     ""))
+        self.mysql_db.set(       d.get("mysql_db",       ""))
+
+        # Passwort entschlüsseln
+        try:
+            pw = base64.b64decode(d.get("mysql_pass_b64", "")).decode()
+        except Exception:
+            pw = ""
+        self.mysql_pass.set(pw)
+
+        # Treiber setzen (nach refresh, damit Combobox-Werte bekannt sind)
+        saved_driver = d.get("driver", "")
+        if saved_driver:
+            self.driver_var.set(saved_driver)
+
+        self._profile_var.set(profile)
+        self._refresh_profiles()
+
+        ts = d.get("saved_at", "")
+        msg = f"✓ Profil '{profile}' geladen  (gespeichert: {ts})"
+        self._cfg_status.config(text=f"Profil '{profile}' geladen", foreground="#006600")
+        self.log(msg)
+        self.after(4000, lambda: self._cfg_status.config(text=""))
+
+    def _delete_profile(self):
+        profile = self._profile_var.get().strip()
+        if not profile:
+            return
+        if not messagebox.askyesno("Profil löschen", f"Profil '{profile}' wirklich löschen?"):
+            return
+
+        all_cfg = self._all_profiles()
+        if profile in all_cfg:
+            del all_cfg[profile]
+            with open(_CFG_FILE, "w", encoding="utf-8") as fh:
+                json.dump(all_cfg, fh, ensure_ascii=False, indent=2)
+            self.log(f"Profil '{profile}' gelöscht.")
+
+        self._refresh_profiles()
+        if all_cfg:
+            self._profile_var.set(next(iter(all_cfg)))
+        else:
+            self._profile_var.set("Standard")
 
 
 # ════════════════════════════════════════════════════════════════════════════
