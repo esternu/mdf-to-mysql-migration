@@ -17,7 +17,16 @@ import threading
 import re
 import os
 import sys
+import datetime
+import subprocess as _subprocess
 from typing import Optional, List, Dict, Any
+
+# Log-Datei neben dem Skript ablegen
+_LOG_DIR  = os.path.dirname(os.path.abspath(__file__))
+_LOG_FILE = os.path.join(
+    _LOG_DIR,
+    f"migration_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+)
 
 # ── Optionale Imports mit Fehlermeldung ──────────────────────────────────────
 try:
@@ -553,22 +562,95 @@ class App(tk.Tk):
 
     def _build_log_tab(self):
         f = self.tab_log
-        self.log_text = scrolledtext.ScrolledText(f, font=("Consolas", 9), state="disabled")
+
+        # Log-Datei Pfad-Anzeige
+        path_frame = ttk.Frame(f)
+        path_frame.pack(fill="x", padx=4, pady=(4, 0))
+        ttk.Label(path_frame, text="Log-Datei:").pack(side="left")
+        self._log_path_var = tk.StringVar(value=_LOG_FILE)
+        ttk.Entry(path_frame, textvariable=self._log_path_var,
+                  state="readonly", width=70).pack(side="left", padx=4)
+        ttk.Button(path_frame, text="Im Explorer öffnen",
+                   command=self._open_log_folder).pack(side="left", padx=2)
+
+        # Textbereich
+        self.log_text = scrolledtext.ScrolledText(
+            f, font=("Consolas", 9), state="disabled", wrap="none"
+        )
         self.log_text.pack(fill="both", expand=True, padx=4, pady=4)
-        ttk.Button(f, text="Log leeren", command=self._clear_log).pack(anchor="e", padx=4, pady=2)
+
+        # Farbliche Markierung für Fehler/Warnungen/Erfolg
+        self.log_text.tag_config("error",   foreground="#cc0000", font=("Consolas", 9, "bold"))
+        self.log_text.tag_config("warning", foreground="#b36200")
+        self.log_text.tag_config("success", foreground="#006600", font=("Consolas", 9, "bold"))
+        self.log_text.tag_config("section", foreground="#00008b", font=("Consolas", 9, "bold"))
+        self.log_text.tag_config("ts",      foreground="#888888")
+
+        # Button-Leiste
+        btn_frame = ttk.Frame(f)
+        btn_frame.pack(fill="x", padx=4, pady=2)
+        ttk.Button(btn_frame, text="Log leeren",     command=self._clear_log).pack(side="right", padx=2)
+        ttk.Button(btn_frame, text="Log kopieren",   command=self._copy_log).pack(side="right", padx=2)
+
+        # Erste Zeile in Log-Datei schreiben
+        with open(_LOG_FILE, "w", encoding="utf-8") as fh:
+            fh.write(f"=== MDF-to-MySQL Migration Log  {datetime.datetime.now():%Y-%m-%d %H:%M:%S} ===\n")
 
     # ── Hilfsmethoden ────────────────────────────────────────────────────
     def log(self, msg: str):
+        ts    = datetime.datetime.now().strftime("%H:%M:%S")
+        lower = msg.lower().strip()
+
+        # Tag für Farbmarkierung ermitteln
+        if lower.startswith("fehler") or lower.startswith("error") or "fehler:" in lower:
+            tag = "error"
+        elif lower.startswith("⚠") or "warnung" in lower or lower.startswith("warning"):
+            tag = "warning"
+        elif lower.startswith("✓") or "erfolgreich" in lower or lower.startswith("fertig"):
+            tag = "success"
+        elif lower.startswith("──") or lower.startswith("=="):
+            tag = "section"
+        else:
+            tag = None
+
         self.log_text.config(state="normal")
-        self.log_text.insert("end", msg + "\n")
+        # Zeitstempel (grau)
+        self.log_text.insert("end", f"[{ts}] ", "ts")
+        # Nachricht (ggf. farbig)
+        if tag:
+            self.log_text.insert("end", msg + "\n", tag)
+        else:
+            self.log_text.insert("end", msg + "\n")
         self.log_text.see("end")
         self.log_text.config(state="disabled")
         self.update_idletasks()
+
+        # Gleichzeitig in Datei schreiben
+        try:
+            with open(_LOG_FILE, "a", encoding="utf-8") as fh:
+                fh.write(f"[{ts}] {msg}\n")
+        except OSError:
+            pass
 
     def _clear_log(self):
         self.log_text.config(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.config(state="disabled")
+        # Log-Datei ebenfalls leeren
+        try:
+            with open(_LOG_FILE, "w", encoding="utf-8") as fh:
+                fh.write(f"=== Log geleert  {datetime.datetime.now():%Y-%m-%d %H:%M:%S} ===\n")
+        except OSError:
+            pass
+
+    def _copy_log(self):
+        content = self.log_text.get("1.0", "end").strip()
+        self.clipboard_clear()
+        self.clipboard_append(content)
+        self.log("✓ Log in Zwischenablage kopiert.")
+
+    def _open_log_folder(self):
+        _subprocess.Popen(["explorer", "/select,", os.path.normpath(_LOG_FILE)])
 
     def _browse_mdf(self):
         path = filedialog.askopenfilename(
