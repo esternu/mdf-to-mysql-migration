@@ -179,7 +179,26 @@ def _win_path(path: str) -> str:
     """Konvertiert Pfad-Separatoren zu Windows-Backslashes (SQL Server-Anforderung)."""
     return os.path.normpath(path).replace("/", "\\")
 
-def attach_mdf(mdf_path: str, db_name: str, driver: str, log) -> "pyodbc.Connection":
+class MdfSession:
+    """Hält pyodbc-Connection + Cleanup-Infos zusammen.
+    pyodbc.Connection ist ein C-Extension-Objekt und erlaubt keine
+    dynamischen Attribute – daher dieser schlanke Wrapper."""
+    def __init__(self, conn: "pyodbc.Connection", db_name: str,
+                 driver: str, tmp_dir: str) -> None:
+        self.conn    = conn
+        self.db_name = db_name
+        self.driver  = driver
+        self.tmp_dir = tmp_dir
+
+    # Cursor-Delegation damit read_schema() unverändert bleibt
+    def cursor(self):
+        return self.conn.cursor()
+
+    def close(self):
+        self.conn.close()
+
+
+def attach_mdf(mdf_path: str, db_name: str, driver: str, log) -> MdfSession:
     """Hängt eine KOPIE der .mdf-Datei an LocalDB an.
     Die Original-Datei wird nie verändert."""
     import shutil, tempfile
@@ -197,8 +216,8 @@ def attach_mdf(mdf_path: str, db_name: str, driver: str, log) -> "pyodbc.Connect
         log(f"LocalDB-Start übersprungen ({e})")
 
     # ── Temporäre Kopie erstellen (Original bleibt unberührt) ─────────────
-    tmp_dir  = tempfile.mkdtemp(prefix="mdf_migration_")
-    tmp_mdf  = os.path.join(tmp_dir, os.path.basename(mdf_path))
+    tmp_dir = tempfile.mkdtemp(prefix="mdf_migration_")
+    tmp_mdf = os.path.join(tmp_dir, os.path.basename(mdf_path))
     log(f"Erstelle temporäre Kopie: {tmp_mdf}")
     shutil.copy2(mdf_path, tmp_mdf)
 
@@ -242,38 +261,30 @@ def attach_mdf(mdf_path: str, db_name: str, driver: str, log) -> "pyodbc.Connect
     master_conn.close()
 
     conn = pyodbc.connect(_build_conn_str(driver, database=db_name))
-    # Temp-Verzeichnis am Objekt merken → wird nach read_schema() aufgeräumt
-    conn._mdf_tmp_dir  = tmp_dir
-    conn._mdf_db_name  = db_name
-    conn._mdf_driver   = driver
-    return conn
+    return MdfSession(conn, db_name, driver, tmp_dir)
 
 
-def detach_and_cleanup(conn: "pyodbc.Connection", log) -> None:
+def detach_and_cleanup(session: MdfSession, log) -> None:
     """Detacht die temporäre DB und löscht die Kopien."""
     import shutil
-    db_name = getattr(conn, "_mdf_db_name",  None)
-    tmp_dir = getattr(conn, "_mdf_tmp_dir",  None)
-    driver  = getattr(conn, "_mdf_driver",   None)
     try:
-        conn.close()
+        session.close()
     except Exception:
         pass
-    if db_name and driver:
+    try:
+        mc = pyodbc.connect(_build_conn_str(session.driver), autocommit=True)
+        mc.cursor().execute(
+            f"ALTER DATABASE [{session.db_name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE"
+        )
+        mc.cursor().execute(f"EXEC sp_detach_db '{session.db_name}', 'true'")
+        mc.close()
+        log(f"Temporäre DB [{session.db_name}] detacht.")
+    except Exception as e:
+        log(f"Detach-Warnung: {e}")
+    if os.path.isdir(session.tmp_dir):
         try:
-            mc = pyodbc.connect(_build_conn_str(driver), autocommit=True)
-            mc.cursor().execute(
-                f"ALTER DATABASE [{db_name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE"
-            )
-            mc.cursor().execute(f"EXEC sp_detach_db '{db_name}', 'true'")
-            mc.close()
-            log(f"Temporäre DB [{db_name}] detacht.")
-        except Exception as e:
-            log(f"Detach-Warnung: {e}")
-    if tmp_dir and os.path.isdir(tmp_dir):
-        try:
-            shutil.rmtree(tmp_dir)
-            log(f"Temp-Kopien gelöscht: {tmp_dir}")
+            shutil.rmtree(session.tmp_dir)
+            log(f"Temp-Kopien gelöscht: {session.tmp_dir}")
         except Exception as e:
             log(f"Temp-Löschen fehlgeschlagen: {e}")
 
@@ -821,19 +832,19 @@ class App(tk.Tk):
             return
 
         def task():
-            conn = None
+            session = None
             try:
                 self.log(f"── Schema lesen: {mdf}")
                 self.log("Original-Datei wird nicht verändert – Tool arbeitet auf Kopie.")
-                conn = attach_mdf(mdf, self.db_attach_name.get(), driver, self.log)
-                self._schema = read_schema(conn, self.log)
+                session = attach_mdf(mdf, self.db_attach_name.get(), driver, self.log)
+                self._schema = read_schema(session, self.log)
                 self.log("Schema erfolgreich gelesen. → DDL generieren klicken.")
             except Exception as e:
                 self.log(f"FEHLER: {e}")
                 messagebox.showerror("Fehler", str(e))
             finally:
-                if conn is not None:
-                    detach_and_cleanup(conn, self.log)
+                if session is not None:
+                    detach_and_cleanup(session, self.log)
 
         threading.Thread(target=task, daemon=True).start()
 
