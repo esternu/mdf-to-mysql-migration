@@ -563,9 +563,9 @@ def convert_view_sql(tsql: str) -> tuple:
     sql = re.sub(r'\bTOP\s+\d+\b', '', sql, flags=re.IGNORECASE)
 
     # ── STRING_AGG → GROUP_CONCAT ─────────────────────────────────────────
-    # T-SQL:  STRING_AGG(col, ', ') WITHIN GROUP (ORDER BY col)
-    # MySQL:  GROUP_CONCAT(col ORDER BY col SEPARATOR ', ')
-    def _string_agg_to_group_concat(m: re.Match) -> str:
+    # T-SQL:  STRING_AGG(x, ', ') WITHIN GROUP (ORDER BY x)
+    # MySQL:  GROUP_CONCAT(x ORDER BY x SEPARATOR ', ')
+    def _string_agg_repl(m: re.Match) -> str:
         expr      = m.group(1).strip()
         separator = m.group(2).strip().strip("'\"")
         order_col = m.group(3).strip() if m.group(3) else None
@@ -573,35 +573,57 @@ def convert_view_sql(tsql: str) -> tuple:
             return f"GROUP_CONCAT({expr} ORDER BY {order_col} SEPARATOR '{separator}')"
         return f"GROUP_CONCAT({expr} SEPARATOR '{separator}')"
 
+    # Mit WITHIN GROUP (häufig)
     sql = re.sub(
         r'\bSTRING_AGG\s*\(\s*(.+?)\s*,\s*([\'"][^\'"]*[\'"])\s*\)'
         r'\s*WITHIN\s+GROUP\s*\(\s*ORDER\s+BY\s+(.+?)\s*\)',
-        _string_agg_to_group_concat,
+        _string_agg_repl,
         sql,
         flags=re.IGNORECASE | re.DOTALL,
     )
-    # STRING_AGG ohne WITHIN GROUP (seltener)
+    # Ohne WITHIN GROUP (seltener)
     sql = re.sub(
         r'\bSTRING_AGG\s*\(\s*(.+?)\s*,\s*([\'"][^\'"]*[\'"])\s*\)',
-        lambda m: f"GROUP_CONCAT({m.group(1).strip()} SEPARATOR '{m.group(2).strip().strip(chr(39)+chr(34))}')",
+        lambda m: f"GROUP_CONCAT({m.group(1).strip()} SEPARATOR "
+                  f"'{m.group(2).strip().strip(chr(39)+chr(34))}')",
         sql,
         flags=re.IGNORECASE | re.DOTALL,
     )
 
-    # ── OUTER APPLY / CROSS APPLY → Warnung ──────────────────────────────
-    # Kein direktes MySQL-Äquivalent – muss manuell als Subquery umgeschrieben werden
-    if re.search(r'\b(OUTER|CROSS)\s+APPLY\b', sql, flags=re.IGNORECASE):
-        warnings.append(
-            "OUTER/CROSS APPLY ist nicht MySQL-kompatibel. "
-            "Bitte als korrelierte Subquery oder LEFT JOIN umschreiben."
-        )
-        # Placeholder-Kommentar einbauen damit CREATE VIEW nicht mit Syntax-Fehler scheitert
-        sql = re.sub(
-            r'\b(OUTER|CROSS)\s+APPLY\s*\(',
-            r'/* TODO: \1 APPLY -> Subquery umschreiben */ LATERAL (',
-            sql,
-            flags=re.IGNORECASE,
-        )
+    # ── OUTER APPLY → LEFT JOIN LATERAL (...) ON TRUE ────────────────────
+    # T-SQL:  OUTER APPLY (subquery) alias
+    # MySQL:  LEFT JOIN LATERAL (subquery) alias ON TRUE
+    sql = re.sub(
+        r'\bOUTER\s+APPLY\s*\(',
+        'LEFT JOIN LATERAL (',
+        sql,
+        flags=re.IGNORECASE,
+    )
+    # Alias nach der schließenden Klammer braucht kein ON TRUE – das fügen wir
+    # hinter dem Alias ein. Da wir den Alias nicht kennen, ergänzen wir ON TRUE
+    # nach dem Alias-Token mit einem zweiten Pass.
+    sql = re.sub(
+        r'(LEFT\s+JOIN\s+LATERAL\s*\(.*?\)\s*)(\w+)(?!\s+ON\b)',
+        r'\1\2 ON TRUE',
+        sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # ── CROSS APPLY → JOIN LATERAL (...) ON TRUE ─────────────────────────
+    # T-SQL:  CROSS APPLY (subquery) alias
+    # MySQL:  JOIN LATERAL (subquery) alias ON TRUE
+    sql = re.sub(
+        r'\bCROSS\s+APPLY\s*\(',
+        'JOIN LATERAL (',
+        sql,
+        flags=re.IGNORECASE,
+    )
+    sql = re.sub(
+        r'((?<!LEFT\s)JOIN\s+LATERAL\s*\(.*?\)\s*)(\w+)(?!\s+ON\b)',
+        r'\1\2 ON TRUE',
+        sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
 
     # Doppelte Leerzeilen bereinigen
     sql = re.sub(r'\n{3,}', '\n\n', sql)
