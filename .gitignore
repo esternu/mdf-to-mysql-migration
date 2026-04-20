@@ -26,3 +26,4 @@ config.json
 # Windows
 Thumbs.db
 desktop.ini
+last_generated.sql
