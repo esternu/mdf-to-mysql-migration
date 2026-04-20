@@ -440,11 +440,15 @@ def generate_mysql_ddl(schema: dict, target_db: str) -> str:
     lines.append("SET FOREIGN_KEY_CHECKS = 1;")
     lines.append("")
 
-    # Views — T-SQL → MySQL Basis-Konvertierung
-    for vinfo in schema["views"].values():
+    # Views — topologisch sortiert, damit Abhängigkeiten zuerst erstellt werden
+    sorted_views = _topo_sort_views(schema["views"])
+    for vinfo in sorted_views:
         vname = vinfo["name"]
-        vdef  = convert_view_sql(vinfo["definition"])
+        vdef, warnings = convert_view_sql(vinfo["definition"])
         lines.append(f"DROP VIEW IF EXISTS {mssql_name(vname)};")
+        if warnings:
+            for w in warnings:
+                lines.append(f"-- ⚠ {w}")
         lines.append(f"CREATE VIEW {mssql_name(vname)} AS")
         lines.append(vdef + ";")
         lines.append("")
@@ -452,9 +456,50 @@ def generate_mysql_ddl(schema: dict, target_db: str) -> str:
     return "\n".join(lines)
 
 
-def convert_view_sql(tsql: str) -> str:
-    """Einfache heuristische T-SQL → MySQL Konvertierung für Views."""
+def _topo_sort_views(views: dict) -> list:
+    """Sortiert Views topologisch: zuerst Views ohne Abhängigkeiten,
+    dann Views die andere Views referenzieren."""
+    view_names = {v["name"].lower() for v in views.values()}
+
+    # Abhängigkeiten jeder View ermitteln: welche anderen Views werden referenziert?
+    deps: Dict[str, set] = {}
+    for key, vinfo in views.items():
+        body = vinfo["definition"].lower()
+        found = set()
+        for other_name in view_names:
+            if other_name == vinfo["name"].lower():
+                continue
+            # Suche nach dem View-Namen als eigenständiges Wort im SQL-Body
+            if re.search(r'\b' + re.escape(other_name) + r'\b', body):
+                found.add(other_name)
+        deps[vinfo["name"].lower()] = found
+
+    # Kahn's Algorithmus für topologischen Sort
+    sorted_list: list = []
+    remaining = {v["name"].lower(): v for v in views.values()}
+    iterations = 0
+    while remaining and iterations < len(views) + 1:
+        iterations += 1
+        # Views ohne ausstehende Abhängigkeiten zuerst
+        ready = [
+            name for name, vinfo in remaining.items()
+            if not (deps[name] & set(remaining.keys()) - {name})
+        ]
+        if not ready:
+            # Zyklus erkannt — restliche Views einfach anhängen
+            ready = list(remaining.keys())
+        for name in sorted(ready):  # deterministisch sortieren
+            sorted_list.append(remaining.pop(name))
+
+    return sorted_list
+
+
+def convert_view_sql(tsql: str) -> tuple:
+    """T-SQL → MySQL Konvertierung für View-Definitionen.
+    Gibt (sql, warnings) zurück – warnings ist eine Liste von Strings
+    für Konstrukte die manuell nachbearbeitet werden müssen."""
     sql = tsql.strip()
+    warnings: List[str] = []
 
     # ── CREATE VIEW Header entfernen ──────────────────────────────────────
     # sys.sql_modules liefert den vollständigen T-SQL-Text inkl.
@@ -517,10 +562,51 @@ def convert_view_sql(tsql: str) -> str:
     # TOP n entfernen (kein direktes Äquivalent ohne LIMIT-Position)
     sql = re.sub(r'\bTOP\s+\d+\b', '', sql, flags=re.IGNORECASE)
 
+    # ── STRING_AGG → GROUP_CONCAT ─────────────────────────────────────────
+    # T-SQL:  STRING_AGG(col, ', ') WITHIN GROUP (ORDER BY col)
+    # MySQL:  GROUP_CONCAT(col ORDER BY col SEPARATOR ', ')
+    def _string_agg_to_group_concat(m: re.Match) -> str:
+        expr      = m.group(1).strip()
+        separator = m.group(2).strip().strip("'\"")
+        order_col = m.group(3).strip() if m.group(3) else None
+        if order_col:
+            return f"GROUP_CONCAT({expr} ORDER BY {order_col} SEPARATOR '{separator}')"
+        return f"GROUP_CONCAT({expr} SEPARATOR '{separator}')"
+
+    sql = re.sub(
+        r'\bSTRING_AGG\s*\(\s*(.+?)\s*,\s*([\'"][^\'"]*[\'"])\s*\)'
+        r'\s*WITHIN\s+GROUP\s*\(\s*ORDER\s+BY\s+(.+?)\s*\)',
+        _string_agg_to_group_concat,
+        sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    # STRING_AGG ohne WITHIN GROUP (seltener)
+    sql = re.sub(
+        r'\bSTRING_AGG\s*\(\s*(.+?)\s*,\s*([\'"][^\'"]*[\'"])\s*\)',
+        lambda m: f"GROUP_CONCAT({m.group(1).strip()} SEPARATOR '{m.group(2).strip().strip(chr(39)+chr(34))}')",
+        sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # ── OUTER APPLY / CROSS APPLY → Warnung ──────────────────────────────
+    # Kein direktes MySQL-Äquivalent – muss manuell als Subquery umgeschrieben werden
+    if re.search(r'\b(OUTER|CROSS)\s+APPLY\b', sql, flags=re.IGNORECASE):
+        warnings.append(
+            "OUTER/CROSS APPLY ist nicht MySQL-kompatibel. "
+            "Bitte als korrelierte Subquery oder LEFT JOIN umschreiben."
+        )
+        # Placeholder-Kommentar einbauen damit CREATE VIEW nicht mit Syntax-Fehler scheitert
+        sql = re.sub(
+            r'\b(OUTER|CROSS)\s+APPLY\s*\(',
+            r'/* TODO: \1 APPLY -> Subquery umschreiben */ LATERAL (',
+            sql,
+            flags=re.IGNORECASE,
+        )
+
     # Doppelte Leerzeilen bereinigen
     sql = re.sub(r'\n{3,}', '\n\n', sql)
 
-    return sql.strip()
+    return sql.strip(), warnings
 
 
 # ════════════════════════════════════════════════════════════════════════════
