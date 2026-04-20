@@ -418,21 +418,42 @@ def convert_view_sql(tsql: str) -> str:
     # Bezeichner: [Name] → `Name`
     sql = re.sub(r'\[([^\]]+)\]', r'`\1`', sql)
 
-    # T-SQL Funktionen
-    sql = re.sub(r'\bGETDATE\s*\(\s*\)', 'NOW()', sql, flags=re.IGNORECASE)
-    sql = re.sub(r'\bGETUTCDATE\s*\(\s*\)', 'UTC_TIMESTAMP()', sql, flags=re.IGNORECASE)
-    sql = re.sub(r'\bISNULL\s*\(', 'IFNULL(', sql, flags=re.IGNORECASE)
-    sql = re.sub(r'\bCONVERT\s*\(\s*\w+\s*,\s*', 'CAST(', sql, flags=re.IGNORECASE)
-    sql = re.sub(r'\bLEN\s*\(', 'LENGTH(', sql, flags=re.IGNORECASE)
+    # ── SQL-Server-Datentypen in View-Körpern ersetzen ────────────────────
+    # Tritt auf in CAST(x AS money), CONVERT(money, x) usw.
+    _VIEW_TYPE_MAP = [
+        (r'\bmoney\b',            'DECIMAL(19,4)'),
+        (r'\bsmallmoney\b',       'DECIMAL(10,4)'),
+        (r'\bnvarchar\b',         'CHAR'),
+        (r'\bnchar\b',            'CHAR'),
+        (r'\bntext\b',            'TEXT'),
+        (r'\bdatetime2\b',        'DATETIME'),
+        (r'\bsmalldatetime\b',    'DATETIME'),
+        (r'\bdatetimeoffset\b',   'DATETIME'),
+        (r'\buniqueidentifier\b', 'CHAR(36)'),
+        (r'\bbit\b',              'TINYINT(1)'),
+        (r'\bimage\b',            'LONGBLOB'),
+        (r'\bsql_variant\b',      'TEXT'),
+    ]
+    for pattern, replacement in _VIEW_TYPE_MAP:
+        sql = re.sub(pattern, replacement, sql, flags=re.IGNORECASE)
+
+    # ── T-SQL Funktionen → MySQL ──────────────────────────────────────────
+    sql = re.sub(r'\bGETDATE\s*\(\s*\)',    'NOW()',           sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bGETUTCDATE\s*\(\s*\)','UTC_TIMESTAMP()', sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bISNULL\s*\(',          'IFNULL(',         sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bIIF\s*\(',             'IF(',             sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bLEN\s*\(',             'LENGTH(',         sql, flags=re.IGNORECASE)
     sql = re.sub(r'\bCHARINDEX\s*\(([^,]+),([^)]+)\)',
                  r'LOCATE(\1,\2)', sql, flags=re.IGNORECASE)
-    sql = re.sub(r'\bSUBSTRING\s*\(', 'SUBSTRING(', sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bSUBSTRING\s*\(',      'SUBSTRING(',      sql, flags=re.IGNORECASE)
+    # CONVERT: MySQL hat dieselbe Syntax CONVERT(expr, type) wie T-SQL –
+    # Typnamen wurden bereits oben ersetzt, kein weiterer Umbau nötig.
 
     # WITH (NOLOCK) entfernen
     sql = re.sub(r'\bWITH\s*\(\s*NOLOCK\s*\)', '', sql, flags=re.IGNORECASE)
 
-    # TOP n → LIMIT n (vereinfacht, nur am Ende)
-    sql = re.sub(r'\bTOP\s+(\d+)\b', '', sql, flags=re.IGNORECASE)
+    # TOP n entfernen (kein direktes Äquivalent ohne LIMIT-Position)
+    sql = re.sub(r'\bTOP\s+\d+\b', '', sql, flags=re.IGNORECASE)
 
     # Doppelte Leerzeilen bereinigen
     sql = re.sub(r'\n{3,}', '\n\n', sql)
