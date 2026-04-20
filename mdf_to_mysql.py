@@ -313,11 +313,17 @@ def read_schema(conn: pyodbc.Connection, log) -> dict:
             })
 
     # ── Views ──
+    # INFORMATION_SCHEMA.VIEWS.VIEW_DEFINITION ist auf 4000 Zeichen begrenzt →
+    # sys.sql_modules.definition ist nvarchar(MAX) und liefert den vollständigen Text.
     log("Lese View-Definitionen …")
     cur.execute("""
-        SELECT TABLE_SCHEMA, TABLE_NAME, VIEW_DEFINITION
-        FROM INFORMATION_SCHEMA.VIEWS
-        ORDER BY TABLE_SCHEMA, TABLE_NAME
+        SELECT
+            OBJECT_SCHEMA_NAME(v.object_id) AS vschema,
+            v.name                           AS vname,
+            m.definition                     AS vdef
+        FROM sys.views        v
+        JOIN sys.sql_modules  m ON m.object_id = v.object_id
+        ORDER BY vschema, vname
     """)
     for vschema, vname, vdef in cur.fetchall():
         schema["views"][f"{vschema}.{vname}"] = {
@@ -397,18 +403,20 @@ def convert_view_sql(tsql: str) -> str:
     sql = tsql.strip()
 
     # ── CREATE VIEW Header entfernen ──────────────────────────────────────
-    # INFORMATION_SCHEMA.VIEW_DEFINITION enthält den kompletten T-SQL-Text
-    # inkl. "CREATE VIEW [dbo].[Name] AS" – das wird von uns neu generiert.
-    # Regex: CREATE VIEW <optionales_schema>.<name> AS  (mehrzeilig tolerant)
+    # sys.sql_modules liefert den vollständigen T-SQL-Text inkl.
+    # "CREATE VIEW [dbo].[Name] AS" – das wird von uns neu generiert.
+    # KEIN DOTALL: Verhindert, dass der Regex über Zeilenenden hinaus greift
+    # und Teile des SELECT-Bodys mitfrisst.
+    # View-Namen dürfen Leerzeichen nur innerhalb von [] enthalten.
     sql = re.sub(
-        r'(?i)^\s*CREATE\s+VIEW\s+'          # CREATE VIEW
-        r'(?:\[?[\w\s]+\]?\.)?'              # optionales Schema (dbo. / [dbo].)
-        r'\[?[\w\s]+\]?'                     # View-Name
-        r'\s*(?:\([^)]*\))?\s*AS\s*',        # optionale Spaltenliste + AS
+        r'^\s*CREATE\s+VIEW\s+'              # CREATE VIEW
+        r'(?:\[[\w\s]+\]|\w+)'              # Schema: [dbo] oder dbo
+        r'(?:\.(?:\[[\w\s]+\]|\w+))?'       # optionaler .ViewName-Teil
+        r'\s*(?:\([^)]*\))?\s*\bAS\b\s*',   # optionale Spaltenliste + AS
         '',
         sql,
         count=1,
-        flags=re.IGNORECASE | re.DOTALL,
+        flags=re.IGNORECASE,                 # kein DOTALL – schützt SELECT-Body
     ).strip()
 
     # ── Schema-Präfixe entfernen: [dbo]. und dbo. → nichts ───────────────
