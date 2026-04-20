@@ -110,20 +110,54 @@ def convert_default(default_val: Optional[str]) -> Optional[str]:
 #  SQL Server Zugriff
 # ════════════════════════════════════════════════════════════════════════════
 def get_mssql_drivers() -> List[str]:
+    """Gibt verfügbare SQL-Server-ODBC-Treiber zurück.
+    Moderne Treiber (ODBC Driver 18/17) werden bevorzugt – der alte
+    'SQL Server'-Treiber unterstützt keine LocalDB-Verbindungen."""
     if not PYODBC_OK:
         return []
-    return [d for d in pyodbc.drivers() if "SQL Server" in d or "ODBC Driver" in d]
-
-def attach_mdf(mdf_path: str, db_name: str, driver: str, log) -> pyodbc.Connection:
-    """Hängt die .mdf-Datei an LocalDB / SQL Server an und gibt eine Verbindung zurück."""
-    conn_str = (
-        f"DRIVER={{{driver}}};"
-        "SERVER=(localdb)\\MSSQLLocalDB;"
-        "Trusted_Connection=yes;"
-        "AutoTranslate=no;"
+    all_drivers = pyodbc.drivers()
+    # Moderne Treiber zuerst (höchste Versionsnummer vorne)
+    modern = sorted(
+        [d for d in all_drivers if d.startswith("ODBC Driver") and "SQL Server" in d],
+        key=lambda d: [int(x) for x in re.findall(r'\d+', d)],
+        reverse=True,
     )
+    # Legacy-Treiber ans Ende (nur als Fallback)
+    legacy = [d for d in all_drivers if d == "SQL Server"]
+    return modern + legacy
+
+def _build_conn_str(driver: str, database: Optional[str] = None) -> str:
+    """Erstellt den ODBC-Connection-String passend zum gewählten Treiber."""
+    parts = [
+        f"DRIVER={{{driver}}}",
+        "SERVER=(localdb)\\MSSQLLocalDB",
+        "Trusted_Connection=yes",
+        "AutoTranslate=no",
+    ]
+    # ODBC Driver 18 erzwingt verschlüsselte Verbindungen – für LocalDB deaktivieren
+    if "18" in driver:
+        parts.append("Encrypt=no")
+        parts.append("TrustServerCertificate=yes")
+    if database:
+        parts.append(f"DATABASE={database}")
+    return ";".join(parts) + ";"
+
+def attach_mdf(mdf_path: str, db_name: str, driver: str, log) -> "pyodbc.Connection":
+    """Hängt die .mdf-Datei an LocalDB / SQL Server an und gibt eine Verbindung zurück."""
     log(f"Verbinde mit LocalDB via Treiber: {driver}")
-    master_conn = pyodbc.connect(conn_str, autocommit=True)
+
+    # LocalDB-Instanz starten (falls Stopped)
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["SqlLocalDB", "start", "MSSQLLocalDB"],
+            capture_output=True, text=True, timeout=15
+        )
+        log(f"LocalDB: {result.stdout.strip() or result.stderr.strip() or 'gestartet'}")
+    except Exception as e:
+        log(f"LocalDB-Start übersprungen ({e})")
+
+    master_conn = pyodbc.connect(_build_conn_str(driver), autocommit=True)
     cur = master_conn.cursor()
 
     # Prüfen ob DB bereits angehängt
@@ -139,14 +173,7 @@ def attach_mdf(mdf_path: str, db_name: str, driver: str, log) -> pyodbc.Connecti
         log(f"Datenbank [{db_name}] bereits vorhanden, verwende vorhandene.")
 
     master_conn.close()
-
-    db_conn_str = (
-        f"DRIVER={{{driver}}};"
-        "SERVER=(localdb)\\MSSQLLocalDB;"
-        f"DATABASE={db_name};"
-        "Trusted_Connection=yes;"
-    )
-    return pyodbc.connect(db_conn_str)
+    return pyodbc.connect(_build_conn_str(driver, database=db_name))
 
 
 def read_schema(conn: pyodbc.Connection, log) -> dict:
