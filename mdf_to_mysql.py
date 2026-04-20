@@ -392,10 +392,26 @@ def generate_mysql_ddl(schema: dict, target_db: str) -> str:
 
 def convert_view_sql(tsql: str) -> str:
     """Einfache heuristische T-SQL → MySQL Konvertierung für Views."""
-    sql = tsql
+    sql = tsql.strip()
 
-    # Schema-Präfixe entfernen: [dbo]. → nichts
+    # ── CREATE VIEW Header entfernen ──────────────────────────────────────
+    # INFORMATION_SCHEMA.VIEW_DEFINITION enthält den kompletten T-SQL-Text
+    # inkl. "CREATE VIEW [dbo].[Name] AS" – das wird von uns neu generiert.
+    # Regex: CREATE VIEW <optionales_schema>.<name> AS  (mehrzeilig tolerant)
+    sql = re.sub(
+        r'(?i)^\s*CREATE\s+VIEW\s+'          # CREATE VIEW
+        r'(?:\[?[\w\s]+\]?\.)?'              # optionales Schema (dbo. / [dbo].)
+        r'\[?[\w\s]+\]?'                     # View-Name
+        r'\s*(?:\([^)]*\))?\s*AS\s*',        # optionale Spaltenliste + AS
+        '',
+        sql,
+        count=1,
+        flags=re.IGNORECASE | re.DOTALL,
+    ).strip()
+
+    # ── Schema-Präfixe entfernen: [dbo]. und dbo. → nichts ───────────────
     sql = re.sub(r'\[dbo\]\.', '', sql)
+    sql = re.sub(r'\bdbo\.', '', sql)
 
     # Bezeichner: [Name] → `Name`
     sql = re.sub(r'\[([^\]]+)\]', r'`\1`', sql)
