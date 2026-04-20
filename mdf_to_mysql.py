@@ -23,10 +23,12 @@ import datetime
 import subprocess as _subprocess
 from typing import Optional, List, Dict, Any
 
-# Pfade neben dem Skript
-_LOG_DIR  = os.path.dirname(os.path.abspath(__file__))
-_CFG_FILE = os.path.join(_LOG_DIR, "config.json")
-_LOG_FILE = os.path.join(
+# Pfade
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))          # …/mdf-to-mysql-migration
+_CFG_FILE   = os.path.join(_SCRIPT_DIR, "config.json")
+_LOG_DIR    = os.path.join(os.path.dirname(_SCRIPT_DIR), "mdf-to-mysql-logs")  # eine Ebene höher
+os.makedirs(_LOG_DIR, exist_ok=True)                               # Ordner beim Start anlegen
+_LOG_FILE   = os.path.join(
     _LOG_DIR,
     f"migration_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 )
