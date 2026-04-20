@@ -180,13 +180,15 @@ def _win_path(path: str) -> str:
     return os.path.normpath(path).replace("/", "\\")
 
 def attach_mdf(mdf_path: str, db_name: str, driver: str, log) -> "pyodbc.Connection":
-    """Hängt die .mdf-Datei an LocalDB / SQL Server an und gibt eine Verbindung zurück."""
+    """Hängt eine KOPIE der .mdf-Datei an LocalDB an.
+    Die Original-Datei wird nie verändert."""
+    import shutil, tempfile
+
     log(f"Verbinde mit LocalDB via Treiber: {driver}")
 
-    # LocalDB-Instanz starten (falls Stopped)
+    # ── LocalDB starten ───────────────────────────────────────────────────
     try:
-        import subprocess
-        result = subprocess.run(
+        result = _subprocess.run(
             ["SqlLocalDB", "start", "MSSQLLocalDB"],
             capture_output=True, text=True, timeout=15
         )
@@ -194,45 +196,86 @@ def attach_mdf(mdf_path: str, db_name: str, driver: str, log) -> "pyodbc.Connect
     except Exception as e:
         log(f"LocalDB-Start übersprungen ({e})")
 
+    # ── Temporäre Kopie erstellen (Original bleibt unberührt) ─────────────
+    tmp_dir  = tempfile.mkdtemp(prefix="mdf_migration_")
+    tmp_mdf  = os.path.join(tmp_dir, os.path.basename(mdf_path))
+    log(f"Erstelle temporäre Kopie: {tmp_mdf}")
+    shutil.copy2(mdf_path, tmp_mdf)
+
+    ldf_path = _find_ldf(mdf_path)
+    tmp_ldf  = None
+    if ldf_path:
+        tmp_ldf = os.path.join(tmp_dir, os.path.basename(ldf_path))
+        shutil.copy2(ldf_path, tmp_ldf)
+        log(f"LDF-Kopie: {tmp_ldf}")
+
+    # ── Vorherige gleichnamige DB ggf. detachen ───────────────────────────
     master_conn = pyodbc.connect(_build_conn_str(driver), autocommit=True)
     cur = master_conn.cursor()
-
-    # Prüfen ob DB bereits angehängt
     cur.execute("SELECT name FROM sys.databases WHERE name = ?", db_name)
-    if not cur.fetchone():
-        # Pfade normalisieren: Forward-Slashes → Backslashes (SQL Server-Pflicht)
-        mdf_win  = _win_path(mdf_path).replace("'", "''")
-        ldf_path = _find_ldf(mdf_path)
+    if cur.fetchone():
+        log(f"Detache vorhandene DB [{db_name}] …")
+        cur.execute(f"ALTER DATABASE [{db_name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE")
+        cur.execute(f"EXEC sp_detach_db '{db_name}', 'true'")
 
-        if ldf_path:
-            # LDF gefunden → FOR ATTACH mit beiden Dateien (zuverlässiger)
-            ldf_win = _win_path(ldf_path).replace("'", "''")
-            log(f"LDF gefunden: {ldf_win}")
-            log(f"Hänge [{db_name}] an (MDF + LDF) …")
-            sql = (
-                f"CREATE DATABASE [{db_name}] ON "
-                f"(FILENAME='{mdf_win}'), "
-                f"(FILENAME='{ldf_win}') "
-                f"FOR ATTACH"
-            )
-        else:
-            # Kein LDF → Log-Datei neu erstellen lassen
-            log(f"Kein LDF gefunden – Log wird neu erstellt.")
-            log(f"Hänge [{db_name}] an (nur MDF) …")
-            sql = (
-                f"CREATE DATABASE [{db_name}] ON "
-                f"(FILENAME='{mdf_win}') "
-                f"FOR ATTACH_REBUILD_LOG"
-            )
-
-        log(f"SQL: {sql}")
-        cur.execute(sql)
-        log("Datenbank erfolgreich angehängt.")
+    # ── Kopie anhängen ────────────────────────────────────────────────────
+    mdf_win = _win_path(tmp_mdf).replace("'", "''")
+    if tmp_ldf:
+        ldf_win = _win_path(tmp_ldf).replace("'", "''")
+        log(f"Hänge Kopie an (MDF + LDF) …")
+        sql = (
+            f"CREATE DATABASE [{db_name}] ON "
+            f"(FILENAME='{mdf_win}'), "
+            f"(FILENAME='{ldf_win}') "
+            f"FOR ATTACH"
+        )
     else:
-        log(f"Datenbank [{db_name}] bereits vorhanden, verwende vorhandene.")
+        log(f"Hänge Kopie an (nur MDF, Log wird neu erstellt) …")
+        sql = (
+            f"CREATE DATABASE [{db_name}] ON "
+            f"(FILENAME='{mdf_win}') "
+            f"FOR ATTACH_REBUILD_LOG"
+        )
 
+    cur.execute(sql)
+    log("Temporäre Datenbank angehängt.")
     master_conn.close()
-    return pyodbc.connect(_build_conn_str(driver, database=db_name))
+
+    conn = pyodbc.connect(_build_conn_str(driver, database=db_name))
+    # Temp-Verzeichnis am Objekt merken → wird nach read_schema() aufgeräumt
+    conn._mdf_tmp_dir  = tmp_dir
+    conn._mdf_db_name  = db_name
+    conn._mdf_driver   = driver
+    return conn
+
+
+def detach_and_cleanup(conn: "pyodbc.Connection", log) -> None:
+    """Detacht die temporäre DB und löscht die Kopien."""
+    import shutil
+    db_name = getattr(conn, "_mdf_db_name",  None)
+    tmp_dir = getattr(conn, "_mdf_tmp_dir",  None)
+    driver  = getattr(conn, "_mdf_driver",   None)
+    try:
+        conn.close()
+    except Exception:
+        pass
+    if db_name and driver:
+        try:
+            mc = pyodbc.connect(_build_conn_str(driver), autocommit=True)
+            mc.cursor().execute(
+                f"ALTER DATABASE [{db_name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE"
+            )
+            mc.cursor().execute(f"EXEC sp_detach_db '{db_name}', 'true'")
+            mc.close()
+            log(f"Temporäre DB [{db_name}] detacht.")
+        except Exception as e:
+            log(f"Detach-Warnung: {e}")
+    if tmp_dir and os.path.isdir(tmp_dir):
+        try:
+            shutil.rmtree(tmp_dir)
+            log(f"Temp-Kopien gelöscht: {tmp_dir}")
+        except Exception as e:
+            log(f"Temp-Löschen fehlgeschlagen: {e}")
 
 
 def read_schema(conn: pyodbc.Connection, log) -> dict:
@@ -778,15 +821,19 @@ class App(tk.Tk):
             return
 
         def task():
+            conn = None
             try:
                 self.log(f"── Schema lesen: {mdf}")
+                self.log("Original-Datei wird nicht verändert – Tool arbeitet auf Kopie.")
                 conn = attach_mdf(mdf, self.db_attach_name.get(), driver, self.log)
                 self._schema = read_schema(conn, self.log)
-                conn.close()
                 self.log("Schema erfolgreich gelesen. → DDL generieren klicken.")
             except Exception as e:
                 self.log(f"FEHLER: {e}")
                 messagebox.showerror("Fehler", str(e))
+            finally:
+                if conn is not None:
+                    detach_and_cleanup(conn, self.log)
 
         threading.Thread(target=task, daemon=True).start()
 
