@@ -26,5 +26,7 @@ config.json
 # Windows
 Thumbs.db
 desktop.ini
-last_generated.sql
 .idea
+
+# Generated SQL files in temp/
+temp/*.sql
