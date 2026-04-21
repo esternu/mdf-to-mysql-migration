@@ -1,0 +1,29 @@
+# Konfiguration mit Zugangsdaten
+config.json
+
+# Datenbank-Dateien (nicht im Image)
+*.mdf
+*.ldf
+*.ndf
+
+# Generierte SQL-Ausgaben
+temp/
+
+# Tests (nicht im Image benötigt)
+tests/
+
+# Python-Cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Logs
+*.log
+mdf-to-mysql-logs/
+
+# Git / IDE
+.git/
+.github/
+.idea/
+.venv/
+venv/

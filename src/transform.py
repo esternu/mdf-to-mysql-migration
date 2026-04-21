@@ -77,14 +77,20 @@ def mssql_name(name: str) -> str:
 
 
 def convert_default(default_val: Optional[str]) -> Optional[str]:
-    """Konvertiert einen SQL-Server-DEFAULT-Ausdruck in MySQL-Syntax."""
+    """Konvertiert einen SQL-Server-DEFAULT-Ausdruck in MySQL-Syntax.
+
+    SQL Server speichert Defaults als '(expr)' oder '((expr))'.
+    strip("()") entfernt alle führenden/abschliessenden Klammern zeichenweise,
+    sodass '(getdate())' → 'getdate' wird (nicht 'getdate()').
+    """
     if default_val is None:
         return None
     d     = default_val.strip().strip("()")
     lower = d.lower()
-    if lower in ("getdate()", "getutcdate()"):
+    # Nach strip("()") sind Klammern bereits entfernt
+    if lower in ("getdate", "getutcdate"):
         return "CURRENT_TIMESTAMP"
-    if lower == "newid()":
+    if lower == "newid":
         return None   # UUID() als DEFAULT nur ab MySQL 8.x
     if lower == "1":
         return "'1'"

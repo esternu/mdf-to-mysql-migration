@@ -1,0 +1,60 @@
+name: CI
+
+# Auslöser: jeder Push und jeder Pull Request auf beliebigen Branch
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  # ══════════════════════════════════════════════════════════════════════════
+  #  Test-Job: Pytest auf ubuntu-latest
+  # ══════════════════════════════════════════════════════════════════════════
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false          # alle Python-Versionen durchlaufen lassen
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python ${{ matrix.python-version }} einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # unixodbc-dev wird benötigt um pyodbc auf Linux zu kompilieren
+      - name: System-Abhängigkeiten installieren
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends unixodbc-dev
+
+      - name: Python-Pakete installieren
+        run: pip install --upgrade pip && pip install -r requirements.txt
+
+      - name: Pytest ausführen
+        run: pytest tests/ -v --tb=short
+
+  # ══════════════════════════════════════════════════════════════════════════
+  #  Docker-Build-Job: Dockerfile validieren
+  #  Läuft nur wenn alle Tests bestanden wurden.
+  # ══════════════════════════════════════════════════════════════════════════
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs: test                 # nur nach bestandenen Tests
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Docker Image bauen
+        run: |
+          docker build \
+            --no-cache \
+            --tag mdf-to-mysql:${{ github.sha }} \
+            .

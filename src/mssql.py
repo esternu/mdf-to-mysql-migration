@@ -39,13 +39,34 @@ def get_mssql_drivers() -> List[str]:
 
 
 def _build_conn_str(driver: str, database: Optional[str] = None) -> str:
-    """Erstellt den ODBC-Connection-String passend zum gewählten Treiber."""
+    """Erstellt den ODBC-Connection-String passend zum gewählten Treiber.
+
+    Umgebungsvariablen (für Docker / Linux):
+      MSSQL_SERVER   – Serveradresse (Standard: (localdb)\\MSSQLLocalDB)
+      MSSQL_USER     – SQL-Auth Benutzername (optional; leer → Windows-Auth)
+      MSSQL_PASS     – SQL-Auth Passwort     (optional; leer → Windows-Auth)
+    """
+    server    = os.environ.get("MSSQL_SERVER", r"(localdb)\MSSQLLocalDB")
+    sql_user  = os.environ.get("MSSQL_USER", "")
+    sql_pass  = os.environ.get("MSSQL_PASS", "")
+
     parts = [
         f"DRIVER={{{driver}}}",
-        "SERVER=(localdb)\\MSSQLLocalDB",
-        "Trusted_Connection=yes",
+        f"SERVER={server}",
         "AutoTranslate=no",
     ]
+
+    if sql_user and sql_pass:
+        # SQL Server-Authentifizierung (benötigt für Docker / Remote-Server)
+        parts += [
+            f"UID={sql_user}",
+            f"PWD={sql_pass}",
+            "Trusted_Connection=no",
+        ]
+    else:
+        # Windows-Authentifizierung (Standard für LocalDB)
+        parts.append("Trusted_Connection=yes")
+
     if "18" in driver:
         parts.append("Encrypt=no")
         parts.append("TrustServerCertificate=yes")
@@ -100,15 +121,16 @@ def attach_mdf(mdf_path: str, db_name: str, driver: str, log) -> MdfSession:
 
     log(f"Verbinde mit LocalDB via Treiber: {driver}")
 
-    # LocalDB starten
-    try:
-        result = _subprocess.run(
-            ["SqlLocalDB", "start", "MSSQLLocalDB"],
-            capture_output=True, text=True, timeout=15
-        )
-        log(f"LocalDB: {result.stdout.strip() or result.stderr.strip() or 'gestartet'}")
-    except Exception as e:
-        log(f"LocalDB-Start übersprungen ({e})")
+    # LocalDB starten (nur auf Windows ohne expliziten MSSQL_SERVER)
+    if not os.environ.get("MSSQL_SERVER"):
+        try:
+            result = _subprocess.run(
+                ["SqlLocalDB", "start", "MSSQLLocalDB"],
+                capture_output=True, text=True, timeout=15
+            )
+            log(f"LocalDB: {result.stdout.strip() or result.stderr.strip() or 'gestartet'}")
+        except Exception as e:
+            log(f"LocalDB-Start übersprungen ({e})")
 
     # Temporäre Kopie erstellen (Original bleibt unberührt)
     tmp_dir = tempfile.mkdtemp(prefix="mdf_migration_")
