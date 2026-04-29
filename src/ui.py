@@ -14,10 +14,11 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Optional
 
 # Interne Module
-from paths    import CFG_FILE, LOG_FILE, TEMP_DIR
-from mssql    import attach_mdf, detach_and_cleanup, get_mssql_drivers, PYODBC_OK
-from transform import generate_mysql_ddl
-from deploy   import deploy_to_mysql, MYSQL_OK
+from paths        import CFG_FILE, LOG_FILE, TEMP_DIR
+from mssql        import attach_mdf, detach_and_cleanup, get_mssql_drivers, PYODBC_OK
+from transform    import generate_mysql_ddl
+from deploy       import deploy_to_mysql, MYSQL_OK
+from migrate_data import get_table_list, migrate_all
 
 try:
     import mysql.connector
@@ -64,6 +65,15 @@ class App(tk.Tk):
         ttk.Button(btn_frame, text="Schema lesen",          command=self._read_schema).pack(side="left", padx=4)
         ttk.Button(btn_frame, text="DDL generieren",        command=self._generate_ddl).pack(side="left", padx=4)
         ttk.Button(btn_frame, text="DDL speichern …",       command=self._save_ddl).pack(side="left", padx=4)
+
+        # Checkbox: Daten nach dem Schema-Deploy übertragen
+        self._transfer_data_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            btn_frame,
+            text="Daten übertragen",
+            variable=self._transfer_data_var,
+        ).pack(side="left", padx=(12, 2))
+
         ttk.Button(btn_frame, text="▶ Auf MySQL deployen",  command=self._deploy).pack(side="left", padx=4)
         ttk.Button(btn_frame, text="Abhängigkeiten prüfen", command=self._check_deps).pack(side="right", padx=4)
 
@@ -363,20 +373,60 @@ class App(tk.Tk):
         ):
             return
 
+        host     = self.mysql_host.get().strip()
+        port     = int(self.mysql_port.get().strip())
+        user     = self.mysql_user.get().strip()
+        password = self.mysql_pass.get()
+        target_db = self.mysql_db.get().strip()
+
         def task():
+            # ── Schritt 1: DDL deployen ──────────────────────────────────
             try:
                 deploy_to_mysql(
                     ddl,
-                    host=self.mysql_host.get().strip(),
-                    port=int(self.mysql_port.get().strip()),
-                    user=self.mysql_user.get().strip(),
-                    password=self.mysql_pass.get(),
-                    target_db=self.mysql_db.get().strip(),
+                    host=host, port=port, user=user,
+                    password=password, target_db=target_db,
                     log=self.log,
                 )
             except Exception as e:
                 self.log(f"FEHLER beim Deployment: {e}")
                 messagebox.showerror("Fehler", str(e))
+                return
+
+            # ── Schritt 2: Daten übertragen (optional) ───────────────────
+            if not self._transfer_data_var.get():
+                return
+
+            self.log("")
+            self.log("── Daten übertragen")
+            mdf = self.mdf_path.get().strip()
+            if not mdf or not os.path.isfile(mdf):
+                self.log("⚠ Datenmigration übersprungen: keine gültige .mdf-Datei angegeben.")
+                return
+
+            session = None
+            try:
+                session = attach_mdf(
+                    mdf, self.db_attach_name.get(),
+                    self.driver_var.get(), self.log,
+                )
+                tables     = get_table_list(session)
+                mysql_conn = mysql.connector.connect(
+                    host=host, port=port, user=user, password=password,
+                    database=target_db, charset="utf8mb4", connection_timeout=10,
+                )
+                result = migrate_all(session, mysql_conn, tables, self.log)
+                mysql_conn.close()
+                self.log(f"✓ Datenmigration abgeschlossen: {result['total_rows']} Zeilen importiert.")
+                if result["errors"]:
+                    for err in result["errors"]:
+                        self.log(f"  ⚠ {err}")
+            except Exception as e:
+                self.log(f"FEHLER Datenmigration: {e}")
+                messagebox.showerror("Fehler Datenmigration", str(e))
+            finally:
+                if session is not None:
+                    detach_and_cleanup(session, self.log)
 
         threading.Thread(target=task, daemon=True).start()
 
@@ -408,6 +458,7 @@ class App(tk.Tk):
             "mysql_user":     self.mysql_user.get(),
             "mysql_pass_b64": pw_obf,
             "mysql_db":       self.mysql_db.get(),
+            "transfer_data":  self._transfer_data_var.get(),
             "saved_at":       datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         all_cfg          = self._all_profiles()
@@ -444,6 +495,7 @@ class App(tk.Tk):
         except Exception:
             pw = ""
         self.mysql_pass.set(pw)
+        self._transfer_data_var.set(d.get("transfer_data", False))
         saved_driver = d.get("driver", "")
         if saved_driver:
             self.driver_var.set(saved_driver)
