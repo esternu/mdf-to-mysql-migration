@@ -103,6 +103,51 @@ def convert_default(default_val: Optional[str]) -> Optional[str]:
 # ════════════════════════════════════════════════════════════════════════════
 #  Hilfsfunktionen für View-Konvertierung
 # ════════════════════════════════════════════════════════════════════════════
+
+# Operanden die in einer String-Konkatenationskette vorkommen können:
+#   - einfaches String-Literal:  'text'
+#   - Backtick-Bezeichner:       `col name`
+#   - CAST-Ausdruck:             CAST(x AS CHAR(n))  ← eine Ebene Nesting erlaubt
+# Bewusst KEINE einfachen Wörter (verhindert, dass arithmetische Ausdrücke
+# wie "a + b" fälschlich als String-Konkatenation erkannt werden).
+_STR_OPERAND = (
+    r"(?:"
+    r"'[^']*'"                              r"|"  # 'string literal'
+    r"`[^`]+`"                              r"|"  # `backtick identifier`
+    r"CAST\s*\([^()]*(?:\([^()]*\)[^()]*)*\)"    # CAST(x AS CHAR(n)) – 1 Ebene Nesting
+    r")"
+)
+
+# Kette: operand (Leerzeichen + Leerzeichen operand)+
+_STR_CONCAT_CHAIN = re.compile(
+    r"(" + _STR_OPERAND + r"(?:\s*\+\s*" + _STR_OPERAND + r")+)",
+    re.IGNORECASE,
+)
+
+
+def _convert_string_concat(sql: str) -> str:
+    """Ersetzt T-SQL-String-Konkatenation mit ``+`` durch MySQL ``CONCAT()``.
+
+    T-SQL: ``col + ' (' + CAST(id AS CHAR(10)) + ')'``
+    MySQL: ``CONCAT(col, ' (', CAST(id AS CHAR(10)), ')')``
+
+    Konvertiert **nur** Ketten, in denen mindestens ein Operand ein
+    einfaches String-Literal (``'...'``) ist.  Rein arithmetische
+    Ausdrücke (z. B. ``surface + jig_surface``) bleiben unberührt,
+    weil sie keine Backtick-Bezeichner oder CAST-Ausdrücke sind, die
+    mit einem String-Literal gemischt werden.
+    """
+    def _replace(m: re.Match) -> str:
+        chain = m.group(0)
+        # Nur konvertieren wenn mindestens ein String-Literal vorhanden
+        if not re.search(r"'[^']*'", chain):
+            return chain
+        parts = [p.strip() for p in re.split(r"\s*\+\s*", chain)]
+        return "CONCAT(" + ", ".join(parts) + ")"
+
+    return _STR_CONCAT_CHAIN.sub(_replace, sql)
+
+
 def _paren_close(sql: str, open_pos: int) -> int:
     """Gibt den Index der schliessenden ')' zurück, die zu '(' an open_pos gehört."""
     depth = 1
@@ -260,6 +305,9 @@ def convert_view_sql(tsql: str) -> tuple:
 
     # TOP n entfernen
     sql = re.sub(r'\bTOP\s+\d+\b', '', sql, flags=re.IGNORECASE)
+
+    # ── T-SQL String-Konkatenation (+) → MySQL CONCAT() ───────────────────
+    sql = _convert_string_concat(sql)
 
     # ── STRING_AGG → GROUP_CONCAT ─────────────────────────────────────────
     def _string_agg_repl(m: re.Match) -> str:
