@@ -12,6 +12,7 @@ from transform import (
     convert_view_sql,
     generate_mysql_ddl,
     _topo_sort_views,
+    _convert_string_concat,
 )
 
 
@@ -141,6 +142,110 @@ class TestConvertDefault:
 
     def test_empty_string_returns_none(self):
         assert convert_default("('')") is None
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  _convert_string_concat
+# ════════════════════════════════════════════════════════════════════════════
+class TestConvertStringConcat:
+    """Unit-Tests für die T-SQL → CONCAT()-Konvertierung.
+
+    Hintergrund: T-SQL benutzt ``+`` als String-Operator.  In MySQL/MariaDB
+    ist ``+`` nur arithmetisch; String-Verkettung erfordert ``CONCAT()``.
+    Die Funktion wandelt Ketten um, die mindestens ein String-Literal enthalten.
+    """
+
+    # ── Grundlegende Konvertierungen ─────────────────────────────────────
+    def test_backtick_plus_string_literal(self):
+        sql    = "`Name` + ' suffix'"
+        result = _convert_string_concat(sql)
+        assert result == "CONCAT(`Name`, ' suffix')"
+
+    def test_string_literal_plus_backtick(self):
+        sql    = "'prefix ' + `Name`"
+        result = _convert_string_concat(sql)
+        assert result == "CONCAT('prefix ', `Name`)"
+
+    def test_two_string_literals(self):
+        result = _convert_string_concat("'hello' + ' world'")
+        assert result == "CONCAT('hello', ' world')"
+
+    def test_three_part_chain(self):
+        sql    = "`col` + ' (' + `id` + ')'"
+        # `id` ist kein String-Literal und kein CAST → kein Operand
+        # → nur `col` + ' (' wird als Kette erkannt; `id` + ')' ebenfalls
+        # Hauptsache: Ergebnis enthält CONCAT und kein rohes +
+        result = _convert_string_concat(sql)
+        assert "CONCAT" in result
+
+    # ── CAST mit verschachtelten Klammern ────────────────────────────────
+    def test_backtick_plus_cast_char_plus_string(self):
+        """Kernfall aus ViewSurface / ViewSurfaceArticle."""
+        sql    = "`Jig Name` + ' (' + CAST(`Jig Id` AS CHAR(100)) + ')'"
+        result = _convert_string_concat(sql)
+        assert result == "CONCAT(`Jig Name`, ' (', CAST(`Jig Id` AS CHAR(100)), ')')"
+
+    def test_cast_char_preserved_correctly(self):
+        """CAST(x AS CHAR(n)) – das innere n) darf nicht als Kettenende gelten."""
+        sql    = "`col` + ' ' + CAST(`id` AS CHAR(50))"
+        result = _convert_string_concat(sql)
+        assert "CAST(`id` AS CHAR(50))" in result
+        assert "CONCAT" in result
+
+    def test_full_group_concat_chain(self):
+        """GROUP_CONCAT-Kontext: nur die + -Kette wird umgeschrieben,
+        ORDER BY / SEPARATOR bleiben unangetastet."""
+        sql = (
+            "GROUP_CONCAT(`Article Name` + ' (' + "
+            "CAST(`Article Index` AS CHAR(100)) + ')' "
+            "ORDER BY `Article Name` SEPARATOR ', ')"
+        )
+        result = _convert_string_concat(sql)
+        assert "CONCAT(`Article Name`, ' (', CAST(`Article Index` AS CHAR(100)), ')')" in result
+        assert "ORDER BY `Article Name`" in result
+        assert "SEPARATOR ', '" in result
+        assert "GROUP_CONCAT(" in result
+
+    # ── Kein Eingriff bei reiner Arithmetik ─────────────────────────────
+    def test_arithmetic_plain_identifiers_unchanged(self):
+        sql    = "surface_si + jig_surface_si"
+        assert _convert_string_concat(sql) == sql
+
+    def test_backtick_plus_backtick_no_string_unchanged(self):
+        """Zwei Backtick-Bezeichner ohne String-Literal → bleibt arithmetisch."""
+        sql    = "`col_a` + `col_b`"
+        assert _convert_string_concat(sql) == sql
+
+    def test_multiplication_unchanged(self):
+        sql    = "`surface` * `factor`"
+        assert _convert_string_concat(sql) == sql
+
+    def test_empty_string_literal_converted(self):
+        """Leeres String-Literal '' gilt als String-Kontext."""
+        sql    = "`col` + ''"
+        result = _convert_string_concat(sql)
+        assert "CONCAT" in result
+
+    # ── Integration: convert_view_sql ruft _convert_string_concat auf ───
+    def test_convert_view_sql_applies_concat_conversion(self):
+        """convert_view_sql muss _convert_string_concat intern aufrufen."""
+        tsql = "SELECT `col` + ' suffix' AS label FROM t"
+        result, _ = convert_view_sql(tsql)
+        assert "CONCAT(`col`, ' suffix')" in result
+        # Sicherstellen dass kein + string übrig bleibt
+        assert "+ ' suffix'" not in result
+
+    def test_convert_view_sql_cast_chain_in_view(self):
+        """Vollständiger T-SQL-View-Header + CAST-Kette werden korrekt konvertiert."""
+        tsql = (
+            "CREATE VIEW [dbo].[V] AS\n"
+            "SELECT [Jig Name] + ' (' + CAST([Jig Id] AS CHAR(10)) + ')' AS label\n"
+            "FROM [dbo].[T]"
+        )
+        result, _ = convert_view_sql(tsql)
+        assert "CONCAT(" in result
+        assert "CREATE VIEW" not in result   # header entfernt
+        assert "[dbo]" not in result          # schema-prefix entfernt
 
 
 # ════════════════════════════════════════════════════════════════════════════
