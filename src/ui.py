@@ -48,8 +48,10 @@ class App(tk.Tk):
     _LED_SIZE   = 14   # px
 
     def _make_led(self, parent) -> tk.Canvas:
+        # ttk.Frame hat kein -background → Hintergrund vom Root-Fenster holen
+        bg = self.cget("background")
         c = tk.Canvas(parent, width=self._LED_SIZE, height=self._LED_SIZE,
-                      highlightthickness=0, bd=0, bg=parent.cget("background"))
+                      highlightthickness=0, bd=0, bg=bg)
         c.create_oval(2, 2, self._LED_SIZE - 2, self._LED_SIZE - 2,
                       fill=self._LED_COLORS["idle"], outline="#777", tags="led")
         return c
