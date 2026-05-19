@@ -3,17 +3,18 @@ Tests für src/migrate_data.py
 
 Abgedeckte Funktionen:
   - get_table_list   (TestGetTableList)
-  - read_table_data  (TestReadTableData)
+  - iter_table_data  (TestIterTableData)
   - migrate_table    (TestMigrateTable)
   - migrate_all      (TestMigrateAll)
 
 Alle externen Abhängigkeiten (pyodbc-Session, mysql.connector) werden
 vollständig durch Mocks ersetzt – kein laufender Datenbankserver nötig.
 """
+import threading
 import pytest
 from migrate_data import (
     get_table_list,
-    read_table_data,
+    iter_table_data,
     migrate_table,
     migrate_all,
 )
@@ -32,16 +33,10 @@ class _MockCursor:
     """Simpler Cursor-Stub der aufeinanderfolgende fetchall()-Ergebnisse liefert."""
 
     def __init__(self, fetchall_results=None, side_effect=None):
-        """
-        fetchall_results : list of lists
-            Jedes innere Element wird von einem fetchall()-Aufruf zurückgegeben.
-        side_effect : Exception | None
-            Falls gesetzt, wird diese bei execute() geworfen.
-        """
         self._results   = iter(fetchall_results or [[]])
         self._effect    = side_effect
         self.executed   = []
-        self.many_calls = []   # args von executemany
+        self.many_calls = []
         self.closed     = False
 
     def execute(self, sql, *args):
@@ -93,6 +88,37 @@ class _MockMySQLConn:
         self.closed = True
 
 
+def _table_session(col_names, data_rows):
+    """Session-Mock für eine einzelne Tabelle.
+
+    Liefert die fetchall-Sequenz die iter_table_data erwartet:
+      1. Spaltennamen-Query
+      2. Daten-Chunk (alle Zeilen auf einmal, da chunk_size > len(data_rows))
+      3. Leere Liste → Generator stoppt
+    """
+    cols = [(c,) for c in col_names]
+    return _MockSession(fetchall_results=[cols, data_rows, []])
+
+
+def _all_session(tables_data: dict):
+    """Session-Mock für migrate_all.
+
+    tables_data: {table_name: (col_names, data_rows)}
+
+    Fetchall-Sequenz:
+      1. get_row_counts → [(schema, name, count), ...]
+      2. Pro Tabelle: Spalten, Daten
+         (kein [] Terminator nötig: Testdaten < CHUNK_SIZE=5000, Generator endet
+          früher via "if len(rows) < chunk_size: return")
+    """
+    counts = [("dbo", name, len(rows)) for name, (_, rows) in tables_data.items()]
+    results = [counts]
+    for col_names, data_rows in tables_data.values():
+        results.append([(c,) for c in col_names])
+        results.append(data_rows)
+    return _MockSession(fetchall_results=results)
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  get_table_list
 # ════════════════════════════════════════════════════════════════════════════
@@ -115,7 +141,6 @@ class TestGetTableList:
         assert result[0] == ("dbo", "TableUnits")
 
     def test_result_is_list_of_tuples_not_rows(self):
-        """Rückgabe muss eine echte Python-Liste aus Tupeln sein."""
         session = _MockSession(fetchall_results=[[("dbo", "T1"), ("dbo", "T2")]])
         result  = get_table_list(session)
         assert isinstance(result, list)
@@ -138,47 +163,57 @@ class TestGetTableList:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  read_table_data
+#  iter_table_data
 # ════════════════════════════════════════════════════════════════════════════
-class TestReadTableData:
+class TestIterTableData:
 
-    def test_returns_columns_and_rows(self):
-        col_rows  = [("Index",), ("Name",), ("Product",)]
-        data_rows = [(1, "Bangle 1", "Silver"), (2, "Bangle 2", "Gold")]
-        session   = _MockSession(fetchall_results=[col_rows, data_rows])
-        cols, rows = read_table_data(session, "dbo", "TableArticle")
-        assert cols  == ["Index", "Name", "Product"]
-        assert rows  == [(1, "Bangle 1", "Silver"), (2, "Bangle 2", "Gold")]
+    def test_yields_columns_and_rows(self):
+        session = _table_session(["Index", "Name", "Product"],
+                                 [(1, "Bangle 1", "Silver"), (2, "Bangle 2", "Gold")])
+        chunks = list(iter_table_data(session, "dbo", "TableArticle", chunk_size=100))
+        assert len(chunks) == 1
+        cols, rows = chunks[0]
+        assert cols == ["Index", "Name", "Product"]
+        assert rows == [(1, "Bangle 1", "Silver"), (2, "Bangle 2", "Gold")]
 
-    def test_empty_table_returns_empty_rows(self):
-        col_rows = [("Id",), ("Val",)]
-        session  = _MockSession(fetchall_results=[col_rows, []])
-        cols, rows = read_table_data(session, "dbo", "EmptyTable")
-        assert cols  == ["Id", "Val"]
-        assert rows  == []
+    def test_empty_table_yields_nothing(self):
+        session = _MockSession(fetchall_results=[[("Id",)], []])
+        chunks  = list(iter_table_data(session, "dbo", "EmptyTable", chunk_size=100))
+        assert chunks == []
 
-    def test_column_count_matches(self):
-        col_rows  = [("A",), ("B",), ("C",), ("D",)]
-        data_rows = [(1, 2, 3, 4)]
-        session   = _MockSession(fetchall_results=[col_rows, data_rows])
-        cols, rows = read_table_data(session, "dbo", "T")
-        assert len(cols) == 4
-        assert len(rows[0]) == 4
-
-    def test_single_column_table(self):
-        session = _MockSession(fetchall_results=[[("ID",)], [(42,), (43,)]])
-        cols, rows = read_table_data(session, "dbo", "T")
-        assert cols == ["ID"]
-        assert rows == [(42,), (43,)]
+    def test_no_columns_yields_nothing(self):
+        session = _MockSession(fetchall_results=[[]])
+        chunks  = list(iter_table_data(session, "dbo", "T", chunk_size=100))
+        assert chunks == []
 
     def test_none_values_preserved(self):
-        """NULL-Werte müssen als Python-None ankommen."""
-        session = _MockSession(
-            fetchall_results=[[("A",), ("B",)], [(1, None), (None, 2)]]
-        )
-        _, rows = read_table_data(session, "dbo", "T")
+        session = _table_session(["A", "B"], [(1, None), (None, 2)])
+        cols, rows = next(iter(iter_table_data(session, "dbo", "T", chunk_size=100)))
         assert rows[0][1] is None
         assert rows[1][0] is None
+
+    def test_stop_event_aborts_iteration(self):
+        """Gesetztes stop_event muss den Generator sofort beenden."""
+        stop = threading.Event()
+        stop.set()
+        session = _table_session(["Id"], [(1,), (2,)])
+        chunks  = list(iter_table_data(session, "dbo", "T", chunk_size=100,
+                                       stop_event=stop))
+        assert chunks == []
+
+    def test_multiple_chunks(self):
+        """Chunk-Grenze wird korrekt durch leeres fetchall signalisiert."""
+        # Zwei Chunks à 2 Zeilen + abschließendes leeres fetchall
+        session = _MockSession(fetchall_results=[
+            [("Id",)],
+            [(1,), (2,)],   # chunk 1
+            [(3,), (4,)],   # chunk 2
+            [],             # Ende
+        ])
+        chunks = list(iter_table_data(session, "dbo", "T", chunk_size=2))
+        assert len(chunks) == 2
+        assert chunks[0][1] == [(1,), (2,)]
+        assert chunks[1][1] == [(3,), (4,)]
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -187,68 +222,94 @@ class TestReadTableData:
 class TestMigrateTable:
 
     def test_returns_row_count(self):
-        conn  = _MockMySQLConn()
-        count = migrate_table(conn, "TableArticle", ["Id", "Name"], [(1, "A"), (2, "B")], _noop)
+        session = _table_session(["Id", "Name"], [(1, "A"), (2, "B")])
+        conn    = _MockMySQLConn()
+        count   = migrate_table(conn, "TableArticle", session, "dbo", 2, _noop)
         assert count == 2
 
-    def test_empty_rows_returns_zero(self):
-        conn  = _MockMySQLConn()
-        count = migrate_table(conn, "T", ["Id"], [], _noop)
+    def test_empty_table_returns_zero(self):
+        session = _MockSession(fetchall_results=[[("Id",)], []])
+        conn    = _MockMySQLConn()
+        count   = migrate_table(conn, "T", session, "dbo", 0, _noop)
         assert count == 0
 
-    def test_empty_rows_skipped_message_logged(self):
-        conn   = _MockMySQLConn()
-        logged = []
-        migrate_table(conn, "MyTable", ["Id"], [], logged.append)
+    def test_empty_table_skipped_message_logged(self):
+        session = _MockSession(fetchall_results=[[("Id",)], []])
+        conn    = _MockMySQLConn()
+        logged  = []
+        migrate_table(conn, "MyTable", session, "dbo", 0, logged.append)
         assert any("übersprungen" in l or "skipped" in l.lower() for l in logged)
 
     def test_truncate_called_before_insert(self):
-        conn  = _MockMySQLConn()
-        migrate_table(conn, "T", ["Id"], [(1,)], _noop)
+        session = _table_session(["Id"], [(1,)])
+        conn    = _MockMySQLConn()
+        migrate_table(conn, "T", session, "dbo", 1, _noop)
         first_sql = conn._cur.executed[0][0].upper()
         assert "TRUNCATE" in first_sql
 
     def test_executemany_called_with_correct_table(self):
-        conn  = _MockMySQLConn()
-        migrate_table(conn, "TableCost", ["A", "B"], [(1, 2), (3, 4)], _noop)
+        session = _table_session(["A", "B"], [(1, 2), (3, 4)])
+        conn    = _MockMySQLConn()
+        migrate_table(conn, "TableCost", session, "dbo", 2, _noop)
         assert len(conn._cur.many_calls) == 1
         sql, batch = conn._cur.many_calls[0]
         assert "TableCost" in sql
         assert batch == [(1, 2), (3, 4)]
 
     def test_commit_called_after_insert(self):
-        conn  = _MockMySQLConn()
-        migrate_table(conn, "T", ["Id"], [(1,)], _noop)
+        session = _table_session(["Id"], [(1,)])
+        conn    = _MockMySQLConn()
+        migrate_table(conn, "T", session, "dbo", 1, _noop)
         assert conn.committed >= 1
 
     def test_success_logged(self):
-        conn   = _MockMySQLConn()
-        logged = []
-        migrate_table(conn, "TablePlating", ["Id"], [(1,), (2,), (3,)], logged.append)
+        session = _table_session(["Id"], [(1,), (2,), (3,)])
+        conn    = _MockMySQLConn()
+        logged  = []
+        migrate_table(conn, "TablePlating", session, "dbo", 3, logged.append)
         combined = " ".join(logged)
         assert "3" in combined and "TablePlating" in combined
 
     def test_memoryview_converted_to_bytes(self):
-        """memoryview-Werte (BLOB) müssen transparent zu bytes konvertiert werden."""
-        conn  = _MockMySQLConn()
-        data  = memoryview(b"\x00\x01\x02")
-        migrate_table(conn, "T", ["Img"], [(data,)], _noop)
+        data    = memoryview(b"\x00\x01\x02")
+        session = _table_session(["Img"], [(data,)])
+        conn    = _MockMySQLConn()
+        migrate_table(conn, "T", session, "dbo", 1, _noop)
         _, batch = conn._cur.many_calls[0]
         assert isinstance(batch[0][0], (bytes, memoryview))
 
     def test_column_list_in_insert_sql(self):
-        conn  = _MockMySQLConn()
-        migrate_table(conn, "T", ["ColA", "ColB"], [(1, 2)], _noop)
+        session = _table_session(["ColA", "ColB"], [(1, 2)])
+        conn    = _MockMySQLConn()
+        migrate_table(conn, "T", session, "dbo", 1, _noop)
         sql, _ = conn._cur.many_calls[0]
         assert "`ColA`" in sql
         assert "`ColB`" in sql
 
     def test_raises_on_mysql_error(self):
-        """Fehler vom Cursor werden nach oben weitergeleitet."""
         import mysql.connector
-        conn          = _MockMySQLConn(cursor_side_effect=mysql.connector.Error("fail"))
+        session = _table_session(["Id"], [(1,)])
+        conn    = _MockMySQLConn(cursor_side_effect=mysql.connector.Error("fail"))
         with pytest.raises(Exception):
-            migrate_table(conn, "T", ["Id"], [(1,)], _noop)
+            migrate_table(conn, "T", session, "dbo", 1, _noop)
+
+    def test_cancel_via_stop_event(self):
+        stop    = threading.Event()
+        stop.set()
+        session = _table_session(["Id"], [(1,), (2,)])
+        conn    = _MockMySQLConn()
+        count   = migrate_table(conn, "T", session, "dbo", 2, _noop,
+                                stop_event=stop)
+        assert count == 0
+
+    def test_progress_callback_called(self):
+        session   = _table_session(["Id"], [(1,), (2,)])
+        conn      = _MockMySQLConn()
+        calls     = []
+        migrate_table(conn, "T", session, "dbo", 2, _noop,
+                      progress_callback=lambda t, d, total: calls.append((d, total)))
+        assert len(calls) >= 1
+        assert calls[-1][0] == 2
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -256,34 +317,17 @@ class TestMigrateTable:
 # ════════════════════════════════════════════════════════════════════════════
 class TestMigrateAll:
 
-    def _make_session(self, tables_data: dict):
-        """
-        tables_data : {table_name: (columns_rows, data_rows)}
-        Beispiel:
-            {"TableArticle": ([("Id",)], [(1,), (2,)])}
-        """
-        # get_table_list wird nicht über _MockSession gerufen (kommt extern),
-        # aber read_table_data ruft cursor() → fetchall() zweimal pro Tabelle.
-        # Wir bauen die fetchall-Sequenz für alle Tabellen auf.
-        all_results = []
-        for col_rows, data_rows in tables_data.values():
-            all_results.append(col_rows)
-            all_results.append(data_rows)
-        return _MockSession(fetchall_results=all_results)
-
     def test_returns_correct_total_rows(self):
         tables  = [("dbo", "T1"), ("dbo", "T2")]
-        session = self._make_session({
-            "T1": ([("Id",)], [(1,), (2,)]),
-            "T2": ([("Id",)], [(3,)]),
-        })
+        session = _all_session({"T1": (["Id"], [(1,), (2,)]),
+                                "T2": (["Id"], [(3,)])})
         conn   = _MockMySQLConn()
         result = migrate_all(session, conn, tables, _noop)
         assert result["total_rows"] == 3
 
     def test_empty_tables_added_to_skipped(self):
         tables  = [("dbo", "T1")]
-        session = self._make_session({"T1": ([("Id",)], [])})
+        session = _all_session({"T1": (["Id"], [])})
         conn    = _MockMySQLConn()
         result  = migrate_all(session, conn, tables, _noop)
         assert "T1" in result["skipped"]
@@ -291,35 +335,41 @@ class TestMigrateAll:
 
     def test_migrated_dict_contains_correct_counts(self):
         tables  = [("dbo", "A"), ("dbo", "B")]
-        session = self._make_session({
-            "A": ([("Id",)], [(1,), (2,), (3,)]),
-            "B": ([("Id",)], [(10,)]),
-        })
+        session = _all_session({"A": (["Id"], [(1,), (2,), (3,)]),
+                                "B": (["Id"], [(10,)])})
         conn   = _MockMySQLConn()
         result = migrate_all(session, conn, tables, _noop)
         assert result["migrated"]["A"] == 3
         assert result["migrated"]["B"] == 1
 
     def test_error_in_one_table_does_not_abort_others(self):
-        """Wenn T1 fehlschlägt, soll T2 trotzdem migriert werden."""
         import mysql.connector as mc
 
         tables = [("dbo", "T1"), ("dbo", "T2")]
 
         class _MixedCursor:
-            """Wirft bei der ersten executemany, danach nicht mehr."""
             def __init__(self):
-                self._count     = 0
-                self.executed   = []
-                self.many_calls = []
-            def execute(self, sql, *a): self.executed.append(sql)
+                self._executemany_count = 0
+                self.executed           = []
+                self.many_calls         = []
+                self._fetchall_results  = iter([
+                    [("dbo", "T1", 1), ("dbo", "T2", 1)],  # get_row_counts
+                    [("Id",)], [(1,)], [],                   # T1
+                    [("Id",)], [(2,)], [],                   # T2
+                ])
+
+            def execute(self, sql, *a):
+                self.executed.append(sql)
+
             def executemany(self, sql, batch):
-                self._count += 1
-                if self._count == 1:
+                self._executemany_count += 1
+                if self._executemany_count == 1:
                     raise mc.Error("insert fail")
                 self.many_calls.append((sql, batch))
+
             def fetchall(self):
-                return [("Id",)] if self._count == 0 else [(1,)]
+                return list(next(self._fetchall_results, []))
+
             def close(self): pass
 
         class _MixedConn:
@@ -332,11 +382,12 @@ class TestMigrateAll:
             def rollback(self): self.rolled_back += 1
             def close(self): pass
 
-        # Session liefert col+data für T1 und T2
-        session = self._make_session({
-            "T1": ([("Id",)], [(1,)]),
-            "T2": ([("Id",)], [(2,)]),
-        })
+        # Separate session with combined fetchall sequence
+        session = _MockSession(fetchall_results=[
+            [("dbo", "T1", 1), ("dbo", "T2", 1)],  # get_row_counts
+            [("Id",)], [(1,)],                       # T1 (kein [] Terminator nötig)
+            [("Id",)], [(2,)],                       # T2
+        ])
         conn   = _MixedConn()
         result = migrate_all(session, conn, tables, _noop)
 
@@ -344,14 +395,12 @@ class TestMigrateAll:
         assert "T1" in result["errors"][0]
 
     def test_errors_list_populated_on_failure(self):
-        """Fehler beim INSERT sollen im errors-Feld landen."""
         import mysql.connector as mc
 
         tables  = [("dbo", "Bad")]
-        session = self._make_session({"Bad": ([("Id",)], [(1,)])})
+        session = _all_session({"Bad": (["Id"], [(1,)])})
 
         class _FailOnInsert(_MockMySQLConn):
-            """Cursor schlägt nur bei executemany fehl, nicht bei execute."""
             def cursor(self):
                 class _C(_MockCursor):
                     def executemany(self, sql, batch):
@@ -364,11 +413,10 @@ class TestMigrateAll:
         assert "Bad" in result["errors"][0]
 
     def test_rollback_called_on_error(self):
-        """Nach einem INSERT-Fehler muss rollback() aufgerufen werden."""
         import mysql.connector as mc
 
         tables  = [("dbo", "T")]
-        session = self._make_session({"T": ([("Id",)], [(1,)])})
+        session = _all_session({"T": (["Id"], [(1,)])})
 
         class _FailOnInsert(_MockMySQLConn):
             def cursor(self):
@@ -393,14 +441,22 @@ class TestMigrateAll:
         session = _MockSession(fetchall_results=[[]])
         conn    = _MockMySQLConn()
         result  = migrate_all(session, conn, [], _noop)
-        for key in ("total_rows", "skipped", "errors", "migrated"):
+        for key in ("total_rows", "skipped", "errors", "migrated", "cancelled"):
             assert key in result
 
     def test_fk_checks_disabled_and_re_enabled(self):
-        """SET FOREIGN_KEY_CHECKS = 0 und = 1 müssen beide aufgerufen werden."""
-        session = self._make_session({"T": ([("Id",)], [(1,)])})
+        session = _all_session({"T": (["Id"], [(1,)])})
         conn    = _MockMySQLConn()
         migrate_all(session, conn, [("dbo", "T")], _noop)
         sqls = " ".join(stmt[0] for stmt in conn._cur.executed)
         assert "FOREIGN_KEY_CHECKS = 0" in sqls
         assert "FOREIGN_KEY_CHECKS = 1" in sqls
+
+    def test_cancelled_flag_set_when_stop_event_triggered(self):
+        stop    = threading.Event()
+        stop.set()
+        tables  = [("dbo", "T")]
+        session = _all_session({"T": (["Id"], [(1,)])})
+        conn    = _MockMySQLConn()
+        result  = migrate_all(session, conn, tables, _noop, stop_event=stop)
+        assert result["cancelled"] is True
