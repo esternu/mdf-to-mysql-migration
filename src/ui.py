@@ -34,13 +34,29 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("MDF → MySQL Migration Tool")
-        self.geometry("820x720")
+        self.geometry("1230x760")
         self.resizable(True, True)
         self._stop_event = threading.Event()
         self._build_ui()
         self._load_config()
         self._check_deps()
         self._refresh_resume_btn()
+
+    # ── LED-Hilfsmethoden ────────────────────────────────────────────────
+    # Zustände: "idle"=grau, "running"=gelb, "ok"=grün, "error"=rot
+    _LED_COLORS = {"idle": "#aaaaaa", "running": "#e6c200", "ok": "#22aa44", "error": "#cc2222"}
+    _LED_SIZE   = 14   # px
+
+    def _make_led(self, parent) -> tk.Canvas:
+        c = tk.Canvas(parent, width=self._LED_SIZE, height=self._LED_SIZE,
+                      highlightthickness=0, bd=0, bg=parent.cget("background"))
+        c.create_oval(2, 2, self._LED_SIZE - 2, self._LED_SIZE - 2,
+                      fill=self._LED_COLORS["idle"], outline="#777", tags="led")
+        return c
+
+    def _set_led(self, canvas: tk.Canvas, state: str):
+        color = self._LED_COLORS.get(state, self._LED_COLORS["idle"])
+        canvas.itemconfig("led", fill=color)
 
     # ── UI-Aufbau ────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -62,43 +78,52 @@ class App(tk.Tk):
         self._build_ddl_tab()
         self._build_log_tab()
 
-        # Aktions-Buttons
+        # ── Aktions-Buttons mit Status-LEDs ──────────────────────────────
         btn_frame = ttk.Frame(self)
-        btn_frame.pack(fill="x", padx=8, pady=(0, 4))
-        ttk.Button(btn_frame, text="Schema lesen",          command=self._read_schema).pack(side="left", padx=4)
-        ttk.Button(btn_frame, text="DDL generieren",        command=self._generate_ddl).pack(side="left", padx=4)
-        ttk.Button(btn_frame, text="DDL speichern …",       command=self._save_ddl).pack(side="left", padx=4)
+        btn_frame.pack(fill="x", padx=8, pady=(0, 2))
 
-        # Checkbox: Daten nach dem Schema-Deploy übertragen
+        # Schema lesen
+        self._led_schema = self._make_led(btn_frame)
+        self._led_schema.pack(side="left", padx=(4, 2), pady=4)
+        ttk.Button(btn_frame, text="Schema lesen", command=self._read_schema).pack(side="left", padx=(0, 8))
+
+        # DDL generieren
+        self._led_ddl = self._make_led(btn_frame)
+        self._led_ddl.pack(side="left", padx=(4, 2), pady=4)
+        ttk.Button(btn_frame, text="DDL generieren", command=self._generate_ddl).pack(side="left", padx=(0, 2))
+        ttk.Button(btn_frame, text="DDL speichern …", command=self._save_ddl).pack(side="left", padx=(0, 8))
+
+        # Deploy
+        self._led_deploy = self._make_led(btn_frame)
+        self._led_deploy.pack(side="left", padx=(4, 2), pady=4)
+        ttk.Button(btn_frame, text="▶ Auf MySQL deployen", command=self._deploy).pack(side="left", padx=(0, 4))
+
+        # Checkboxen
         self._transfer_data_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            btn_frame,
-            text="Daten übertragen",
-            variable=self._transfer_data_var,
-        ).pack(side="left", padx=(12, 2))
-
-        # Checkbox: Dry-Run
+        ttk.Checkbutton(btn_frame, text="Daten übertragen",
+                        variable=self._transfer_data_var).pack(side="left", padx=(8, 2))
         self._dry_run_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            btn_frame,
-            text="Dry-Run",
-            variable=self._dry_run_var,
-        ).pack(side="left", padx=(4, 2))
+        ttk.Checkbutton(btn_frame, text="Dry-Run",
+                        variable=self._dry_run_var).pack(side="left", padx=(4, 2))
 
-        ttk.Button(btn_frame, text="▶ Auf MySQL deployen",  command=self._deploy).pack(side="left", padx=4)
-        self._cancel_btn = ttk.Button(btn_frame, text="⏹ Abbrechen", command=self._cancel_migration, state="disabled")
+        # Cancel / Resume / Deps
+        self._cancel_btn = ttk.Button(btn_frame, text="⏹ Abbrechen",
+                                      command=self._cancel_migration, state="disabled")
         self._cancel_btn.pack(side="left", padx=4)
-        self._resume_btn = ttk.Button(btn_frame, text="⏩ Resume", command=self._resume_migration, state="disabled")
+        self._resume_btn = ttk.Button(btn_frame, text="⏩ Resume",
+                                      command=self._resume_migration, state="disabled")
         self._resume_btn.pack(side="left", padx=4)
-        ttk.Button(btn_frame, text="Abhängigkeiten prüfen", command=self._check_deps).pack(side="right", padx=4)
+        ttk.Button(btn_frame, text="Abhängigkeiten prüfen",
+                   command=self._check_deps).pack(side="right", padx=4)
 
-        # Fortschrittsanzeige
+        # ── Fortschrittsbalken ────────────────────────────────────────────
         progress_frame = ttk.Frame(self)
         progress_frame.pack(fill="x", padx=8, pady=(0, 2))
         self._progress_var   = tk.DoubleVar(value=0.0)
-        self._progress_bar   = ttk.Progressbar(progress_frame, variable=self._progress_var, maximum=100)
+        self._progress_bar   = ttk.Progressbar(progress_frame, variable=self._progress_var,
+                                               maximum=100, mode="determinate")
         self._progress_bar.pack(fill="x", side="left", expand=True, padx=(0, 8))
-        self._progress_label = ttk.Label(progress_frame, text="", width=38, anchor="w")
+        self._progress_label = ttk.Label(progress_frame, text="", width=42, anchor="w")
         self._progress_label.pack(side="left")
 
         # Konfig-Leiste
@@ -118,21 +143,35 @@ class App(tk.Tk):
 
     def _build_source_tab(self):
         f = self.tab_src
-        ttk.Label(f, text=".mdf Datei:").grid(row=0, column=0, sticky="w", padx=8, pady=6)
+        f.columnconfigure(1, weight=1)   # Spalte 1 (Eingabefelder) dehnt sich mit
+
+        # Zeile 0: Label
+        ttk.Label(f, text=".mdf Datei:").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 0))
+
+        # Zeile 1: Pfadfeld – fast volle Breite, sticky EW
         self.mdf_path = tk.StringVar()
-        ttk.Entry(f, textvariable=self.mdf_path, width=55).grid(row=0, column=1, padx=4, pady=6)
-        ttk.Button(f, text="Durchsuchen …", command=self._browse_mdf).grid(row=0, column=2, padx=4)
+        ttk.Entry(f, textvariable=self.mdf_path).grid(
+            row=1, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 0))
 
-        ttk.Label(f, text="Datenbank-Name (intern):").grid(row=1, column=0, sticky="w", padx=8, pady=6)
+        # Zeile 2: Durchsuchen-Button linksbündig
+        ttk.Button(f, text="Durchsuchen …", command=self._browse_mdf).grid(
+            row=2, column=0, sticky="w", padx=8, pady=(2, 8))
+
+        # Zeile 3: DB-Name
+        ttk.Label(f, text="Datenbank-Name (intern):").grid(row=3, column=0, sticky="w", padx=8, pady=6)
         self.db_attach_name = tk.StringVar(value="MigratedDB")
-        ttk.Entry(f, textvariable=self.db_attach_name, width=30).grid(row=1, column=1, sticky="w", padx=4)
+        ttk.Entry(f, textvariable=self.db_attach_name, width=36).grid(
+            row=3, column=1, sticky="w", padx=4)
 
-        ttk.Label(f, text="ODBC-Treiber:").grid(row=2, column=0, sticky="w", padx=8, pady=6)
+        # Zeile 4: ODBC-Treiber
+        ttk.Label(f, text="ODBC-Treiber:").grid(row=4, column=0, sticky="w", padx=8, pady=6)
         self.driver_var   = tk.StringVar()
-        self.driver_combo = ttk.Combobox(f, textvariable=self.driver_var, width=52)
-        self.driver_combo.grid(row=2, column=1, padx=4, pady=6)
-        ttk.Button(f, text="Treiber aktualisieren", command=self._refresh_drivers).grid(row=2, column=2, padx=4)
+        self.driver_combo = ttk.Combobox(f, textvariable=self.driver_var)
+        self.driver_combo.grid(row=4, column=1, sticky="ew", padx=4, pady=6)
+        ttk.Button(f, text="Treiber aktualisieren", command=self._refresh_drivers).grid(
+            row=4, column=2, padx=8)
 
+        # Zeile 5: Hinweis
         info = (
             "Hinweis: Zum Lesen der .mdf-Datei wird Microsoft SQL Server LocalDB\n"
             "oder SQL Server Express benötigt (kostenlos bei Microsoft erhältlich).\n"
@@ -141,7 +180,7 @@ class App(tk.Tk):
             "und im Tab '3 · DDL-Vorschau' einfügen."
         )
         ttk.Label(f, text=info, foreground="#555", justify="left").grid(
-            row=3, column=0, columnspan=3, padx=8, pady=12, sticky="w")
+            row=5, column=0, columnspan=3, padx=8, pady=12, sticky="w")
         self._refresh_drivers()
 
     def _build_dest_tab(self):
@@ -264,6 +303,9 @@ class App(tk.Tk):
         self._progress_var.set(0.0)
         self._progress_label.config(text="")
 
+    def _set_progress_label(self, text: str):
+        self._progress_label.config(text=text)
+
     def _set_migration_running(self, running: bool):
         state = "normal" if running else "disabled"
         self._cancel_btn.config(state=state)
@@ -358,6 +400,8 @@ class App(tk.Tk):
             return
 
         def task():
+            self.after(0, self._set_led, self._led_schema, "running")
+            self.after(0, self._set_progress_label, "Schema lesen …")
             session = None
             try:
                 self.log(f"── Schema lesen: {mdf}")
@@ -365,9 +409,14 @@ class App(tk.Tk):
                 session      = attach_mdf(mdf, self.db_attach_name.get(), driver, self.log)
                 self._schema = read_schema(session, self.log)
                 self.log("Schema erfolgreich gelesen. → DDL generieren klicken.")
+                self.after(0, self._set_led, self._led_schema, "ok")
+                self.after(0, self._set_progress_label, "Schema gelesen ✓")
+                self.after(0, self._progress_var.set, 33.0)
             except Exception as e:
                 self.log(f"FEHLER: {e}")
-                messagebox.showerror("Fehler", str(e))
+                self.after(0, self._set_led, self._led_schema, "error")
+                self.after(0, self._set_progress_label, f"Fehler: {e}")
+                self.after(0, messagebox.showerror, "Fehler", str(e))
             finally:
                 if session is not None:
                     detach_and_cleanup(session, self.log)
@@ -378,14 +427,24 @@ class App(tk.Tk):
         if not hasattr(self, "_schema"):
             messagebox.showinfo("Hinweis", "Bitte zuerst 'Schema lesen' ausführen.")
             return
-        target_db = self.mysql_db.get().strip() or "migrated_db"
-        self.log(f"Generiere DDL für Zieldatenbank '{target_db}' …")
-        ddl = generate_mysql_ddl(self._schema, target_db)
-        self.ddl_text.delete("1.0", "end")
-        self.ddl_text.insert("1.0", ddl)
-        tcount = len(self._schema["tables"])
-        vcount = len(self._schema["views"])
-        self.log(f"DDL generiert: {tcount} Tabellen, {vcount} Views. Prüfe Tab '3 · DDL-Vorschau'.")
+        self._set_led(self._led_ddl, "running")
+        self._set_progress_label("DDL generieren …")
+        try:
+            target_db = self.mysql_db.get().strip() or "migrated_db"
+            self.log(f"Generiere DDL für Zieldatenbank '{target_db}' …")
+            ddl = generate_mysql_ddl(self._schema, target_db)
+            self.ddl_text.delete("1.0", "end")
+            self.ddl_text.insert("1.0", ddl)
+            tcount = len(self._schema["tables"])
+            vcount = len(self._schema["views"])
+            self.log(f"DDL generiert: {tcount} Tabellen, {vcount} Views. Prüfe Tab '3 · DDL-Vorschau'.")
+            self._set_led(self._led_ddl, "ok")
+            self._set_progress_label(f"DDL generiert: {tcount} Tabellen, {vcount} Views ✓")
+            self._progress_var.set(66.0)
+        except Exception as e:
+            self.log(f"FEHLER DDL: {e}")
+            self._set_led(self._led_ddl, "error")
+            self._set_progress_label(f"Fehler: {e}")
 
     def _save_ddl(self):
         ddl = self.ddl_text.get("1.0", "end").strip()
@@ -455,6 +514,8 @@ class App(tk.Tk):
         def task():
             # ── Schritt 1: DDL deployen (nicht bei Resume oder Dry-Run) ──
             if not resume and not dry_run:
+                self.after(0, self._set_led, self._led_deploy, "running")
+                self.after(0, self._set_progress_label, "DDL wird deployed …")
                 try:
                     deploy_to_mysql(
                         ddl,
@@ -462,8 +523,13 @@ class App(tk.Tk):
                         password=password, target_db=target_db,
                         log=self.log,
                     )
+                    self.after(0, self._set_led, self._led_deploy, "ok")
+                    self.after(0, self._set_progress_label, "DDL deployed ✓")
+                    self.after(0, self._progress_var.set, 100.0)
                 except Exception as e:
                     self.log(f"FEHLER beim Deployment: {e}")
+                    self.after(0, self._set_led, self._led_deploy, "error")
+                    self.after(0, self._set_progress_label, f"Deploy-Fehler: {e}")
                     self.after(0, messagebox.showerror, "Fehler", str(e))
                     return
 
@@ -497,6 +563,7 @@ class App(tk.Tk):
                     host=host, port=port, user=user, password=password,
                     database=target_db, charset="utf8mb4", connection_timeout=10,
                 )
+                self.after(0, self._set_led, self._led_deploy, "running")
                 result = migrate_all(
                     session, mysql_conn, tables, self.log,
                     chunk_size=CHUNK_SIZE,
@@ -508,16 +575,30 @@ class App(tk.Tk):
                 mysql_conn.close()
                 if dry_run:
                     self.log("✓ Dry-Run abgeschlossen – keine Daten geschrieben.")
+                    self.after(0, self._set_led, self._led_deploy, "ok")
+                    self.after(0, self._set_progress_label, "Dry-Run abgeschlossen ✓")
                 elif result["cancelled"]:
                     self.log(f"⚠ Migration abgebrochen: {result['total_rows']:,} Zeilen importiert.")
-                else:
-                    self.log(f"✓ Datenmigration abgeschlossen: {result['total_rows']:,} Zeilen importiert.")
-                if result["errors"]:
+                    self.after(0, self._set_led, self._led_deploy, "error")
+                    self.after(0, self._set_progress_label, f"Abgebrochen – {result['total_rows']:,} Zeilen")
+                elif result["errors"]:
+                    self.log(f"✓ Datenmigration: {result['total_rows']:,} Zeilen, {len(result['errors'])} Fehler.")
+                    self.after(0, self._set_led, self._led_deploy, "error")
+                    self.after(0, self._set_progress_label,
+                               f"{result['total_rows']:,} Zeilen – {len(result['errors'])} Fehler")
                     for err in result["errors"]:
                         self.log(f"  ⚠ {err}")
+                else:
+                    self.log(f"✓ Datenmigration abgeschlossen: {result['total_rows']:,} Zeilen importiert.")
+                    self.after(0, self._set_led, self._led_deploy, "ok")
+                    self.after(0, self._set_progress_label,
+                               f"Migration abgeschlossen: {result['total_rows']:,} Zeilen ✓")
+                    self.after(0, self._progress_var.set, 100.0)
                 self.after(0, self._refresh_resume_btn)
             except Exception as e:
                 self.log(f"FEHLER Datenmigration: {e}")
+                self.after(0, self._set_led, self._led_deploy, "error")
+                self.after(0, self._set_progress_label, f"Fehler: {e}")
                 self.after(0, messagebox.showerror, "Fehler Datenmigration", str(e))
             finally:
                 if session is not None:
