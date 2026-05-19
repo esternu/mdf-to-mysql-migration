@@ -14,11 +14,12 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Optional
 
 # Interne Module
-from paths        import CFG_FILE, LOG_FILE, TEMP_DIR
+from paths        import CFG_FILE, LOG_FILE, TEMP_DIR, CHECKPOINT_FILE
 from mssql        import attach_mdf, detach_and_cleanup, get_mssql_drivers, PYODBC_OK
 from transform    import generate_mysql_ddl
 from deploy       import deploy_to_mysql, MYSQL_OK
-from migrate_data import get_table_list, migrate_all, CHUNK_SIZE
+from migrate_data import (get_table_list, migrate_all, CHUNK_SIZE,
+                          checkpoint_exists, delete_checkpoint, load_checkpoint)
 
 try:
     import mysql.connector
@@ -39,6 +40,7 @@ class App(tk.Tk):
         self._build_ui()
         self._load_config()
         self._check_deps()
+        self._refresh_resume_btn()
 
     # ── UI-Aufbau ────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -75,9 +77,19 @@ class App(tk.Tk):
             variable=self._transfer_data_var,
         ).pack(side="left", padx=(12, 2))
 
+        # Checkbox: Dry-Run
+        self._dry_run_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            btn_frame,
+            text="Dry-Run",
+            variable=self._dry_run_var,
+        ).pack(side="left", padx=(4, 2))
+
         ttk.Button(btn_frame, text="▶ Auf MySQL deployen",  command=self._deploy).pack(side="left", padx=4)
         self._cancel_btn = ttk.Button(btn_frame, text="⏹ Abbrechen", command=self._cancel_migration, state="disabled")
         self._cancel_btn.pack(side="left", padx=4)
+        self._resume_btn = ttk.Button(btn_frame, text="⏩ Resume", command=self._resume_migration, state="disabled")
+        self._resume_btn.pack(side="left", padx=4)
         ttk.Button(btn_frame, text="Abhängigkeiten prüfen", command=self._check_deps).pack(side="right", padx=4)
 
         # Fortschrittsanzeige
@@ -260,6 +272,28 @@ class App(tk.Tk):
         self._stop_event.set()
         self.log("⚠ Abbruch angefordert …")
 
+    def _refresh_resume_btn(self):
+        """Resume-Button aktivieren wenn Checkpoint-Datei existiert."""
+        if checkpoint_exists(CHECKPOINT_FILE):
+            cp    = load_checkpoint(CHECKPOINT_FILE)
+            done  = len(cp.get("completed", []))
+            since = cp.get("started_at", "?")
+            self._resume_btn.config(state="normal")
+            self._resume_btn.config(text=f"⏩ Resume ({done} ✓)")
+            self.log(f"  Checkpoint: {done} Tabellen seit {since} migriert – Resume möglich.")
+        else:
+            self._resume_btn.config(state="disabled", text="⏩ Resume")
+
+    def _resume_migration(self):
+        """Startet Deploy mit vorhandenem Checkpoint (überspringt abgeschlossene Tabellen)."""
+        if not messagebox.askyesno(
+            "Resume Migration",
+            "Migration mit Checkpoint fortsetzen?\n"
+            "Bereits migrierte Tabellen werden übersprungen.",
+        ):
+            return
+        self._deploy(resume=True)
+
     def _copy_log(self):
         content = self.log_text.get("1.0", "end").strip()
         self.clipboard_clear()
@@ -391,7 +425,7 @@ class App(tk.Tk):
             self.log(f"Verbindungsfehler: {e}")
             messagebox.showerror("Verbindungsfehler", str(e))
 
-    def _deploy(self):
+    def _deploy(self, resume: bool = False):
         if not MYSQL_OK:
             messagebox.showerror(
                 "Fehler",
@@ -402,39 +436,47 @@ class App(tk.Tk):
         if not ddl:
             messagebox.showinfo("Hinweis", "DDL-Vorschau ist leer. Bitte zuerst DDL generieren.")
             return
-        if not messagebox.askyesno(
-            "Deployment bestätigen",
-            f"DDL auf {self.mysql_host.get()}:{self.mysql_port.get()}\n"
-            f"Datenbank: {self.mysql_db.get()}\n\nJetzt ausführen?",
-        ):
-            return
 
-        host     = self.mysql_host.get().strip()
-        port     = int(self.mysql_port.get().strip())
-        user     = self.mysql_user.get().strip()
-        password = self.mysql_pass.get()
+        dry_run = self._dry_run_var.get()
+        if not dry_run and not resume:
+            if not messagebox.askyesno(
+                "Deployment bestätigen",
+                f"DDL auf {self.mysql_host.get()}:{self.mysql_port.get()}\n"
+                f"Datenbank: {self.mysql_db.get()}\n\nJetzt ausführen?",
+            ):
+                return
+
+        host      = self.mysql_host.get().strip()
+        port      = int(self.mysql_port.get().strip())
+        user      = self.mysql_user.get().strip()
+        password  = self.mysql_pass.get()
         target_db = self.mysql_db.get().strip()
 
         def task():
-            # ── Schritt 1: DDL deployen ──────────────────────────────────
-            try:
-                deploy_to_mysql(
-                    ddl,
-                    host=host, port=port, user=user,
-                    password=password, target_db=target_db,
-                    log=self.log,
-                )
-            except Exception as e:
-                self.log(f"FEHLER beim Deployment: {e}")
-                self.after(0, messagebox.showerror, "Fehler", str(e))
-                return
+            # ── Schritt 1: DDL deployen (nicht bei Resume oder Dry-Run) ──
+            if not resume and not dry_run:
+                try:
+                    deploy_to_mysql(
+                        ddl,
+                        host=host, port=port, user=user,
+                        password=password, target_db=target_db,
+                        log=self.log,
+                    )
+                except Exception as e:
+                    self.log(f"FEHLER beim Deployment: {e}")
+                    self.after(0, messagebox.showerror, "Fehler", str(e))
+                    return
 
             # ── Schritt 2: Daten übertragen (optional) ───────────────────
-            if not self._transfer_data_var.get():
+            if not self._transfer_data_var.get() and not resume and not dry_run:
+                return
+            if dry_run and not self._transfer_data_var.get():
+                self.log("ℹ Dry-Run: 'Daten übertragen' nicht aktiviert – nur DDL-Vorschau.")
                 return
 
             self.log("")
-            self.log("── Daten übertragen")
+            mode_label = "Dry-Run Vorschau" if dry_run else ("Resume" if resume else "Daten übertragen")
+            self.log(f"── {mode_label}")
             mdf = self.mdf_path.get().strip()
             if not mdf or not os.path.isfile(mdf):
                 self.log("⚠ Datenmigration übersprungen: keine gültige .mdf-Datei angegeben.")
@@ -460,15 +502,20 @@ class App(tk.Tk):
                     chunk_size=CHUNK_SIZE,
                     progress_callback=self._progress_callback,
                     stop_event=self._stop_event,
+                    dry_run=dry_run,
+                    checkpoint_file=CHECKPOINT_FILE,
                 )
                 mysql_conn.close()
-                if result["cancelled"]:
-                    self.log(f"⚠ Migration abgebrochen: {result['total_rows']} Zeilen importiert.")
+                if dry_run:
+                    self.log("✓ Dry-Run abgeschlossen – keine Daten geschrieben.")
+                elif result["cancelled"]:
+                    self.log(f"⚠ Migration abgebrochen: {result['total_rows']:,} Zeilen importiert.")
                 else:
-                    self.log(f"✓ Datenmigration abgeschlossen: {result['total_rows']} Zeilen importiert.")
+                    self.log(f"✓ Datenmigration abgeschlossen: {result['total_rows']:,} Zeilen importiert.")
                 if result["errors"]:
                     for err in result["errors"]:
                         self.log(f"  ⚠ {err}")
+                self.after(0, self._refresh_resume_btn)
             except Exception as e:
                 self.log(f"FEHLER Datenmigration: {e}")
                 self.after(0, messagebox.showerror, "Fehler Datenmigration", str(e))
