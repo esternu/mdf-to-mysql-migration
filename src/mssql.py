@@ -314,6 +314,53 @@ def read_schema(session: MdfSession, log) -> dict:
                 "to_schema": ts, "to_table": tt, "to_col": tc,
             })
 
+    # ── Indexes (UNIQUE + Non-Clustered, ohne PKs) ────────────────────────
+    log("Lese Indexes …")
+    cur.execute("""
+        SELECT
+            OBJECT_SCHEMA_NAME(i.object_id)          AS tschema,
+            OBJECT_NAME(i.object_id)                  AS tname,
+            i.name                                    AS iname,
+            i.is_unique,
+            ic.key_ordinal,
+            COL_NAME(ic.object_id, ic.column_id)      AS col_name,
+            ic.is_descending_key,
+            i.has_filter,
+            i.filter_definition
+        FROM sys.indexes        i
+        JOIN sys.index_columns  ic ON ic.object_id = i.object_id
+                                   AND ic.index_id  = i.index_id
+        WHERE i.type              = 2              -- 2 = NONCLUSTERED
+          AND i.is_primary_key    = 0
+          AND i.is_unique_constraint = 0           -- separate von UNIQUE CONSTRAINT
+          AND ic.is_included_column  = 0           -- nur Schlüsselspalten
+          AND OBJECT_SCHEMA_NAME(i.object_id) != 'sys'
+        ORDER BY tschema, tname, iname, ic.key_ordinal
+    """)
+    for row in cur.fetchall():
+        tschema, tname, iname, is_unique, _, col_name, is_desc, has_filter, filter_def = row
+        key = f"{tschema}.{tname}"
+        if key not in schema["tables"]:
+            continue
+        indexes = schema["tables"][key].setdefault("indexes", [])
+        # Index in Liste suchen oder neu anlegen
+        idx_entry = next((x for x in indexes if x["name"] == iname), None)
+        if idx_entry is None:
+            idx_entry = {
+                "name":       iname,
+                "unique":     bool(is_unique),
+                "columns":    [],
+                "filter":     filter_def or None,
+            }
+            indexes.append(idx_entry)
+        idx_entry["columns"].append({
+            "name": col_name,
+            "desc": bool(is_desc),
+        })
+
+    idx_total = sum(len(t.get("indexes", [])) for t in schema["tables"].values())
+    log(f"Indexes gelesen: {idx_total}")
+
     # ── Views ─────────────────────────────────────────────────────────────
     # INFORMATION_SCHEMA.VIEWS.VIEW_DEFINITION ist auf 4000 Zeichen begrenzt.
     # sys.sql_modules.definition ist nvarchar(MAX) → liefert vollständigen Text.
