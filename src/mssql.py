@@ -159,21 +159,38 @@ def attach_mdf(mdf_path: str, db_name: str, driver: str, log) -> MdfSession:
     if tmp_ldf:
         ldf_win = _win_path(tmp_ldf).replace("'", "''")
         log("Hänge Kopie an (MDF + LDF) …")
-        sql = (
+        sql_attach = (
             f"CREATE DATABASE [{db_name}] ON "
             f"(FILENAME='{mdf_win}'), "
             f"(FILENAME='{ldf_win}') "
             f"FOR ATTACH"
         )
+        sql_rebuild = (
+            f"CREATE DATABASE [{db_name}] ON "
+            f"(FILENAME='{mdf_win}') "
+            f"FOR ATTACH_REBUILD_LOG"
+        )
+        try:
+            cur.execute(sql_attach)
+        except Exception as e:
+            log(f"FOR ATTACH fehlgeschlagen ({e}) – versuche ATTACH_REBUILD_LOG …")
+            # Re-check and detach if the failed attempt left a partial entry
+            cur2 = master_conn.cursor()
+            cur2.execute("SELECT name FROM sys.databases WHERE name = ?", db_name)
+            if cur2.fetchone():
+                cur2.execute(
+                    f"ALTER DATABASE [{db_name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE"
+                )
+                cur2.execute(f"EXEC sp_detach_db '{db_name}', 'true'")
+            cur.execute(sql_rebuild)
     else:
         log("Hänge Kopie an (nur MDF, Log wird neu erstellt) …")
-        sql = (
+        cur.execute(
             f"CREATE DATABASE [{db_name}] ON "
             f"(FILENAME='{mdf_win}') "
             f"FOR ATTACH_REBUILD_LOG"
         )
 
-    cur.execute(sql)
     log("Temporäre Datenbank angehängt.")
     master_conn.close()
 
