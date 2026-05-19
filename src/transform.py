@@ -437,6 +437,31 @@ def generate_mysql_ddl(schema: dict, target_db: str) -> str:
     lines.append("SET FOREIGN_KEY_CHECKS = 1;")
     lines.append("")
 
+    # ── Indexes (UNIQUE und Non-Clustered) ────────────────────────────────
+    has_indexes = any(tinfo.get("indexes") for tinfo in schema["tables"].values())
+    if has_indexes:
+        lines.append("-- Indexes")
+    for tinfo in schema["tables"].values():
+        for idx in tinfo.get("indexes", []):
+            safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', idx["name"])
+            unique_kw = "UNIQUE " if idx["unique"] else ""
+            col_list  = ", ".join(
+                f"{mssql_name(c['name'])} {'DESC' if c['desc'] else 'ASC'}"
+                for c in idx["columns"]
+            )
+            if idx["filter"]:
+                safe_filter = idx["filter"].replace(";", "")
+                lines.append(
+                    f"-- Gefilterter Index (urspr. WHERE {safe_filter})"
+                    f" -- MySQL UNIQUE erlaubt mehrere NULLs, gleichwertiges Verhalten"
+                )
+            lines.append(
+                f"CREATE {unique_kw}INDEX `{safe_name}` "
+                f"ON {mssql_name(tinfo['name'])} ({col_list});"
+            )
+    if has_indexes:
+        lines.append("")
+
     # ── Views (topologisch sortiert) ──────────────────────────────────────
     for vinfo in _topo_sort_views(schema["views"]):
         vname        = vinfo["name"]
