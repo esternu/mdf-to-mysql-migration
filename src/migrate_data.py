@@ -3,8 +3,9 @@ Datenmigration: SQL Server → MySQL.
 
 Enthält vier reine, testbare Kernfunktionen:
   - get_table_list   : Tabellenliste aus SQL Server lesen
-  - read_table_data  : Spalten + Zeilen einer Tabelle lesen
-  - migrate_table    : Einzelne Tabelle in MySQL schreiben
+  - get_row_counts   : Zeilenzahlen aller Tabellen vorab ermitteln
+  - iter_table_data  : Spalten + Zeilen einer Tabelle als Chunk-Generator
+  - migrate_table    : Einzelne Tabelle chunk-weise in MySQL schreiben
   - migrate_all      : Alle Tabellen migrieren, Zusammenfassung zurückgeben
 
 Die Orchestrierung (Verbindungsaufbau, Konfiguration, Logging in Datei)
@@ -12,10 +13,9 @@ Die Orchestrierung (Verbindungsaufbau, Konfiguration, Logging in Datei)
 """
 from __future__ import annotations
 
-from typing import Callable, List, Tuple, Any
+import threading
+from typing import Callable, Dict, Generator, List, Optional, Tuple, Any
 
-# mysql.connector wird nur zur Laufzeit benötigt; optionaler Import
-# ermöglicht Unit-Tests ohne installiertes mysql-connector-python.
 try:
     import mysql.connector
     MYSQL_OK = True
@@ -25,26 +25,19 @@ except ImportError:
 
 
 # ── Typ-Aliase ────────────────────────────────────────────────────────────────
-LogFn      = Callable[[str], None]
-Row        = Tuple[Any, ...]
-TableEntry = Tuple[str, str]          # (schema, table_name)
+LogFn        = Callable[[str], None]
+ProgressFn   = Callable[[str, int, int], None]   # (table, rows_done, rows_total)
+Row          = Tuple[Any, ...]
+TableEntry   = Tuple[str, str]                   # (schema, table_name)
+
+CHUNK_SIZE   = 5_000   # Zeilen pro Batch
 
 
 # ════════════════════════════════════════════════════════════════════════════
 #  1) Tabellenliste aus SQL Server lesen
 # ════════════════════════════════════════════════════════════════════════════
 def get_table_list(session) -> List[TableEntry]:
-    """Gibt eine sortierte Liste aller Basis-Tabellen zurück.
-
-    Parameters
-    ----------
-    session : MdfSession
-        Aktive pyodbc-Session gegen den SQL Server.
-
-    Returns
-    -------
-    list of (schema, table_name) tuples, alphabetisch sortiert.
-    """
+    """Gibt eine sortierte Liste aller Basis-Tabellen zurück."""
     cur = session.cursor()
     cur.execute("""
         SELECT TABLE_SCHEMA, TABLE_NAME
@@ -56,29 +49,55 @@ def get_table_list(session) -> List[TableEntry]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  2) Spalten + Zeilen einer Tabelle lesen
+#  2) Zeilenzahlen vorab ermitteln
 # ════════════════════════════════════════════════════════════════════════════
-def read_table_data(session, schema: str, table: str) -> Tuple[List[str], List[Row]]:
-    """Liest alle Spalten und Zeilen einer SQL-Server-Tabelle.
+def get_row_counts(session, tables: List[TableEntry]) -> Dict[str, int]:
+    """Liest Zeilenzahlen aus sys.partitions (schnell, ohne COUNT(*)-Scan).
 
-    Parameters
-    ----------
-    session : MdfSession
-        Aktive pyodbc-Session.
-    schema : str
-        SQL-Server-Schema (z. B. "dbo").
-    table : str
-        Tabellenname (z. B. "TableArticle").
+    Gibt ein Dict {table_name: row_count} zurück.
+    Tabellen ohne Eintrag (z.B. leere Heap-Tabellen) erhalten den Wert 0.
+    """
+    cur = session.cursor()
+    cur.execute("""
+        SELECT
+            OBJECT_SCHEMA_NAME(p.object_id) AS tschema,
+            OBJECT_NAME(p.object_id)        AS tname,
+            SUM(p.rows)                     AS row_count
+        FROM sys.partitions p
+        WHERE p.index_id IN (0, 1)   -- 0 = heap, 1 = clustered index
+        GROUP BY p.object_id
+    """)
+    counts: Dict[str, int] = {}
+    for tschema, tname, cnt in cur.fetchall():
+        counts[tname] = int(cnt or 0)
 
-    Returns
-    -------
+    # Tabellen die nicht in sys.partitions auftauchen → 0
+    for _, tname in tables:
+        counts.setdefault(tname, 0)
+    return counts
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  3) Spalten + Zeilen einer Tabelle als Chunk-Generator
+# ════════════════════════════════════════════════════════════════════════════
+def iter_table_data(
+    session,
+    schema:     str,
+    table:      str,
+    chunk_size: int = CHUNK_SIZE,
+    stop_event: Optional[threading.Event] = None,
+) -> Generator[Tuple[List[str], List[Row]], None, None]:
+    """Liest Spalten und Zeilen einer Tabelle in Chunks.
+
+    Yields
+    ------
     (columns, rows)
-        columns – Spaltennamen in ORDINAL_POSITION-Reihenfolge
-        rows    – Liste von Tupeln (eine pro Zeile)
+        columns – Spaltennamen (nur beim ersten Yield gefüllt, danach gleich)
+        rows    – Liste von bis zu chunk_size Tupeln
     """
     cur = session.cursor()
 
-    # Spaltennamen in definierter Reihenfolge
+    # Spaltennamen
     cur.execute("""
         SELECT COLUMN_NAME
         FROM   INFORMATION_SCHEMA.COLUMNS
@@ -87,98 +106,104 @@ def read_table_data(session, schema: str, table: str) -> Tuple[List[str], List[R
     """, schema, table)
     columns = [row[0] for row in cur.fetchall()]
 
-    # Alle Zeilen
-    cur.execute(f"SELECT * FROM [{schema}].[{table}]")
-    rows = cur.fetchall()
+    if not columns:
+        return
 
-    return columns, list(rows)
+    # Daten offset-basiert lesen (SQL Server 2012+)
+    offset = 0
+    while True:
+        if stop_event and stop_event.is_set():
+            return
+
+        cur.execute(
+            f"SELECT * FROM [{schema}].[{table}]"
+            f" ORDER BY (SELECT NULL)"
+            f" OFFSET {offset} ROWS FETCH NEXT {chunk_size} ROWS ONLY"
+        )
+        rows = cur.fetchall()
+        if not rows:
+            return
+        yield columns, list(rows)
+        offset += len(rows)
+        if len(rows) < chunk_size:
+            return
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  3) Einzelne Tabelle in MySQL schreiben
+#  4) Einzelne Tabelle chunk-weise in MySQL schreiben
 # ════════════════════════════════════════════════════════════════════════════
 def migrate_table(
     mysql_conn,
-    table_name: str,
-    columns:    List[str],
-    rows:       List[Row],
-    log:        LogFn,
+    table_name:        str,
+    session,
+    schema:            str,
+    row_count:         int,
+    log:               LogFn,
+    chunk_size:        int = CHUNK_SIZE,
+    progress_callback: Optional[ProgressFn] = None,
+    stop_event:        Optional[threading.Event] = None,
 ) -> int:
-    """Leert die Zieltabelle und schreibt alle übergebenen Zeilen.
-
-    Parameters
-    ----------
-    mysql_conn : mysql.connector.connection
-        Offene MySQL-Verbindung.
-    table_name : str
-        Name der Zieltabelle in MySQL.
-    columns : list of str
-        Spaltennamen (müssen in Zieltabelle existieren).
-    rows : list of tuple
-        Zu importierende Zeilen.
-    log : callable
-        Einzeiliger Log-Callback.
+    """Leert die Zieltabelle und schreibt alle Zeilen chunk-weise.
 
     Returns
     -------
-    int
-        Anzahl der importierten Zeilen.
-
-    Raises
-    ------
-    Exception
-        Bei MySQL-Fehlern wird die Ausnahme weitergeleitet;
-        der Aufrufer ist für Rollback und Logging verantwortlich.
+    int  – Anzahl importierter Zeilen (0 wenn leer oder abgebrochen).
     """
-    if not rows:
-        log(f"  {table_name}: leer – übersprungen")
-        return 0
-
     cur = mysql_conn.cursor()
-
-    # Zieltabelle leeren
     cur.execute(f"TRUNCATE TABLE `{table_name}`")
-
-    # INSERT vorbereiten
-    col_list     = ", ".join(f"`{c}`" for c in columns)
-    placeholders = ", ".join(["%s"] * len(columns))
-    insert_sql   = f"INSERT INTO `{table_name}` ({col_list}) VALUES ({placeholders})"
-
-    # bytes-Werte direkt übergeben, Rest unverändert
-    batch = [
-        tuple(val if not isinstance(val, memoryview) else bytes(val) for val in row)
-        for row in rows
-    ]
-
-    cur.executemany(insert_sql, batch)
     mysql_conn.commit()
+
+    rows_done   = 0
+    insert_sql  = None
+    first_chunk = True
+
+    for columns, rows in iter_table_data(session, schema, table_name, chunk_size, stop_event):
+        if stop_event and stop_event.is_set():
+            log(f"  {table_name}: abgebrochen nach {rows_done} Zeilen")
+            return rows_done
+
+        if first_chunk:
+            if not rows:
+                log(f"  {table_name}: leer – übersprungen")
+                return 0
+            col_list    = ", ".join(f"`{c}`" for c in columns)
+            placeholders = ", ".join(["%s"] * len(columns))
+            insert_sql  = f"INSERT INTO `{table_name}` ({col_list}) VALUES ({placeholders})"
+            first_chunk = False
+
+        batch = [
+            tuple(val if not isinstance(val, memoryview) else bytes(val) for val in row)
+            for row in rows
+        ]
+        cur.executemany(insert_sql, batch)
+        mysql_conn.commit()
+        rows_done += len(rows)
+
+        if progress_callback:
+            progress_callback(table_name, rows_done, row_count)
+
     cur.close()
 
-    log(f"  {table_name}: {len(rows)} Zeilen importiert ✓")
-    return len(rows)
+    if rows_done == 0:
+        log(f"  {table_name}: leer – übersprungen")
+    else:
+        log(f"  {table_name}: {rows_done} Zeilen importiert ✓")
+    return rows_done
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  4) Alle Tabellen migrieren
+#  5) Alle Tabellen migrieren
 # ════════════════════════════════════════════════════════════════════════════
 def migrate_all(
     session,
     mysql_conn,
-    tables: List[TableEntry],
-    log:    LogFn,
+    tables:            List[TableEntry],
+    log:               LogFn,
+    chunk_size:        int = CHUNK_SIZE,
+    progress_callback: Optional[ProgressFn] = None,
+    stop_event:        Optional[threading.Event] = None,
 ) -> dict:
     """Migriert alle übergebenen Tabellen von SQL Server nach MySQL.
-
-    Parameters
-    ----------
-    session : MdfSession
-        Aktive SQL-Server-Session.
-    mysql_conn : mysql.connector.connection
-        Offene MySQL-Verbindung.
-    tables : list of (schema, table_name)
-        Zu migrierende Tabellen.
-    log : callable
-        Einzeiliger Log-Callback.
 
     Returns
     -------
@@ -187,21 +212,35 @@ def migrate_all(
         "skipped"      – Namen leerer Tabellen (list of str)
         "errors"       – Fehlermeldungen (list of str)
         "migrated"     – Zeilenzahl pro Tabelle {table: count} (dict)
+        "cancelled"    – True wenn durch stop_event abgebrochen (bool)
     """
     result = {
         "total_rows": 0,
         "skipped":    [],
         "errors":     [],
         "migrated":   {},
+        "cancelled":  False,
     }
+
+    row_counts = get_row_counts(session, tables)
 
     mysql_conn.cursor().execute("SET FOREIGN_KEY_CHECKS = 0")
     mysql_conn.commit()
 
-    for schema, tname in tables:
+    for idx, (schema, tname) in enumerate(tables, 1):
+        if stop_event and stop_event.is_set():
+            result["cancelled"] = True
+            log(f"⚠ Migration abgebrochen nach {idx - 1}/{len(tables)} Tabellen.")
+            break
+
+        log(f"  [{idx}/{len(tables)}] {tname} (~{row_counts.get(tname, 0)} Zeilen) …")
+
         try:
-            columns, rows = read_table_data(session, schema, tname)
-            count = migrate_table(mysql_conn, tname, columns, rows, log)
+            count = migrate_table(
+                mysql_conn, tname, session, schema,
+                row_counts.get(tname, 0),
+                log, chunk_size, progress_callback, stop_event,
+            )
             if count == 0:
                 result["skipped"].append(tname)
             else:

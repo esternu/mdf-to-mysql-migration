@@ -18,7 +18,7 @@ from paths        import CFG_FILE, LOG_FILE, TEMP_DIR
 from mssql        import attach_mdf, detach_and_cleanup, get_mssql_drivers, PYODBC_OK
 from transform    import generate_mysql_ddl
 from deploy       import deploy_to_mysql, MYSQL_OK
-from migrate_data import get_table_list, migrate_all
+from migrate_data import get_table_list, migrate_all, CHUNK_SIZE
 
 try:
     import mysql.connector
@@ -33,8 +33,9 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("MDF → MySQL Migration Tool")
-        self.geometry("820x700")
+        self.geometry("820x720")
         self.resizable(True, True)
+        self._stop_event = threading.Event()
         self._build_ui()
         self._load_config()
         self._check_deps()
@@ -75,7 +76,18 @@ class App(tk.Tk):
         ).pack(side="left", padx=(12, 2))
 
         ttk.Button(btn_frame, text="▶ Auf MySQL deployen",  command=self._deploy).pack(side="left", padx=4)
+        self._cancel_btn = ttk.Button(btn_frame, text="⏹ Abbrechen", command=self._cancel_migration, state="disabled")
+        self._cancel_btn.pack(side="left", padx=4)
         ttk.Button(btn_frame, text="Abhängigkeiten prüfen", command=self._check_deps).pack(side="right", padx=4)
+
+        # Fortschrittsanzeige
+        progress_frame = ttk.Frame(self)
+        progress_frame.pack(fill="x", padx=8, pady=(0, 2))
+        self._progress_var   = tk.DoubleVar(value=0.0)
+        self._progress_bar   = ttk.Progressbar(progress_frame, variable=self._progress_var, maximum=100)
+        self._progress_bar.pack(fill="x", side="left", expand=True, padx=(0, 8))
+        self._progress_label = ttk.Label(progress_frame, text="", width=38, anchor="w")
+        self._progress_label.pack(side="left")
 
         # Konfig-Leiste
         cfg_frame = ttk.Frame(self)
@@ -223,6 +235,30 @@ class App(tk.Tk):
                 fh.write(f"=== Log geleert  {datetime.datetime.now():%Y-%m-%d %H:%M:%S} ===\n")
         except OSError:
             pass
+
+    # ── Fortschritt / Cancel ─────────────────────────────────────────────
+    def _set_progress(self, table: str, rows_done: int, rows_total: int):
+        """Wird aus dem Worker-Thread via after() aufgerufen."""
+        pct = (rows_done / rows_total * 100) if rows_total > 0 else 0
+        self._progress_var.set(pct)
+        self._progress_label.config(
+            text=f"{table}: {rows_done:,} / {rows_total:,} Zeilen"
+        )
+
+    def _progress_callback(self, table: str, rows_done: int, rows_total: int):
+        self.after(0, self._set_progress, table, rows_done, rows_total)
+
+    def _reset_progress(self):
+        self._progress_var.set(0.0)
+        self._progress_label.config(text="")
+
+    def _set_migration_running(self, running: bool):
+        state = "normal" if running else "disabled"
+        self._cancel_btn.config(state=state)
+
+    def _cancel_migration(self):
+        self._stop_event.set()
+        self.log("⚠ Abbruch angefordert …")
 
     def _copy_log(self):
         content = self.log_text.get("1.0", "end").strip()
@@ -390,7 +426,7 @@ class App(tk.Tk):
                 )
             except Exception as e:
                 self.log(f"FEHLER beim Deployment: {e}")
-                messagebox.showerror("Fehler", str(e))
+                self.after(0, messagebox.showerror, "Fehler", str(e))
                 return
 
             # ── Schritt 2: Daten übertragen (optional) ───────────────────
@@ -404,6 +440,10 @@ class App(tk.Tk):
                 self.log("⚠ Datenmigration übersprungen: keine gültige .mdf-Datei angegeben.")
                 return
 
+            self._stop_event.clear()
+            self.after(0, self._set_migration_running, True)
+            self.after(0, self._reset_progress)
+
             session = None
             try:
                 session = attach_mdf(
@@ -415,18 +455,27 @@ class App(tk.Tk):
                     host=host, port=port, user=user, password=password,
                     database=target_db, charset="utf8mb4", connection_timeout=10,
                 )
-                result = migrate_all(session, mysql_conn, tables, self.log)
+                result = migrate_all(
+                    session, mysql_conn, tables, self.log,
+                    chunk_size=CHUNK_SIZE,
+                    progress_callback=self._progress_callback,
+                    stop_event=self._stop_event,
+                )
                 mysql_conn.close()
-                self.log(f"✓ Datenmigration abgeschlossen: {result['total_rows']} Zeilen importiert.")
+                if result["cancelled"]:
+                    self.log(f"⚠ Migration abgebrochen: {result['total_rows']} Zeilen importiert.")
+                else:
+                    self.log(f"✓ Datenmigration abgeschlossen: {result['total_rows']} Zeilen importiert.")
                 if result["errors"]:
                     for err in result["errors"]:
                         self.log(f"  ⚠ {err}")
             except Exception as e:
                 self.log(f"FEHLER Datenmigration: {e}")
-                messagebox.showerror("Fehler Datenmigration", str(e))
+                self.after(0, messagebox.showerror, "Fehler Datenmigration", str(e))
             finally:
                 if session is not None:
                     detach_and_cleanup(session, self.log)
+                self.after(0, self._set_migration_running, False)
 
         threading.Thread(target=task, daemon=True).start()
 
