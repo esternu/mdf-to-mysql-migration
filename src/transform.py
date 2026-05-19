@@ -450,9 +450,10 @@ def generate_mysql_ddl(schema: dict, target_db: str) -> str:
                 for c in idx["columns"]
             )
             if idx["filter"]:
+                safe_filter = idx["filter"].replace(";", "")
                 lines.append(
-                    f"-- Gefilterter Index (urspr. WHERE {idx['filter']}); "
-                    f"MySQL UNIQUE erlaubt mehrere NULLs – gleichwertiges Verhalten"
+                    f"-- Gefilterter Index (urspr. WHERE {safe_filter})"
+                    f" -- MySQL UNIQUE erlaubt mehrere NULLs, gleichwertiges Verhalten"
                 )
             lines.append(
                 f"CREATE {unique_kw}INDEX `{safe_name}` "
