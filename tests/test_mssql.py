@@ -210,13 +210,15 @@ class TestGetMssqlDrivers:
 class TestReadSchema:
     """read_schema bekommt eine MdfSession mit gemocktem pyodbc-Cursor."""
 
-    def _session(self, mocker, col_rows=None, pk_rows=None, fk_rows=None, view_rows=None):
+    def _session(self, mocker, col_rows=None, pk_rows=None, fk_rows=None,
+                 index_rows=None, view_rows=None):
         mock_cur  = mocker.MagicMock()
         mock_cur.fetchall.side_effect = [
-            col_rows  or [],
-            pk_rows   or [],
-            fk_rows   or [],
-            view_rows or [],
+            col_rows   or [],
+            pk_rows    or [],
+            fk_rows    or [],
+            index_rows or [],   # neu: sys.indexes Abfrage
+            view_rows  or [],
         ]
         mock_conn = mocker.MagicMock()
         mock_conn.cursor.return_value = mock_cur
