@@ -52,7 +52,7 @@ DRIVER     = cfg["driver"]
 MYSQL_HOST = cfg["mysql_host"]
 MYSQL_PORT = int(cfg["mysql_port"])
 MYSQL_DB   = cfg["mysql_db"]
-MYSQL_USER = "nocodb"
+MYSQL_USER = cfg["mysql_user"]
 MYSQL_PASS = base64.b64decode(cfg["mysql_pass_b64"]).decode()
 
 log(f"=== Datenmigration {datetime.datetime.now():%Y-%m-%d %H:%M:%S} ===")

@@ -207,13 +207,18 @@ def detach_and_cleanup(session: MdfSession, log) -> None:
     except Exception:
         pass
     try:
-        mc = pyodbc.connect(_build_conn_str(session.driver), autocommit=True)
-        mc.cursor().execute(
-            f"ALTER DATABASE [{session.db_name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE"
-        )
-        mc.cursor().execute(f"EXEC sp_detach_db '{session.db_name}', 'true'")
+        mc  = pyodbc.connect(_build_conn_str(session.driver), autocommit=True)
+        cur = mc.cursor()
+        cur.execute("SELECT name FROM sys.databases WHERE name = ?", session.db_name)
+        if cur.fetchone():
+            cur.execute(
+                f"ALTER DATABASE [{session.db_name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE"
+            )
+            cur.execute(f"EXEC sp_detach_db '{session.db_name}', 'true'")
+            log(f"Temporäre DB [{session.db_name}] detacht.")
+        else:
+            log(f"Temporäre DB [{session.db_name}] war nicht angehängt – kein Detach nötig.")
         mc.close()
-        log(f"Temporäre DB [{session.db_name}] detacht.")
     except Exception as e:
         log(f"Detach-Warnung: {e}")
     if os.path.isdir(session.tmp_dir):
