@@ -2,7 +2,7 @@
 MySQL Deployment.
 Verbindet mit dem Synology-MySQL-Server und führt das generierte DDL aus.
 """
-from typing import Callable
+from typing import Callable, Optional
 
 try:
     import mysql.connector
@@ -20,7 +20,9 @@ def deploy_to_mysql(
     password: str,
     target_db: str,
     log: Callable[[str], None],
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> None:
+    """progress_callback(done, total) wird nach jeder ausgeführten Anweisung aufgerufen."""
     """Führt das übergebene DDL-Script auf dem MySQL-Server aus.
 
     Jede durch ';' getrennte Anweisung wird einzeln ausgeführt.
@@ -50,6 +52,8 @@ def deploy_to_mysql(
             conn.commit()
         except mysql.connector.Error as e:
             errors.append(f"[{i}/{total}] {e}\n  SQL: {stmt[:120]}")
+        if progress_callback:
+            progress_callback(i, total)
 
     cur.close()
     conn.close()

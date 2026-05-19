@@ -290,23 +290,56 @@ class App(tk.Tk):
             pass
 
     # ── Fortschritt / Cancel ─────────────────────────────────────────────
-    def _set_progress(self, table: str, rows_done: int, rows_total: int):
-        """Wird aus dem Worker-Thread via after() aufgerufen."""
-        pct = (rows_done / rows_total * 100) if rows_total > 0 else 0
-        self._progress_var.set(pct)
-        self._progress_label.config(
-            text=f"{table}: {rows_done:,} / {rows_total:,} Zeilen"
-        )
+    # ── Fortschritt-Hilfsmethoden ────────────────────────────────────────
+    def _progress_start_indeterminate(self, label: str = ""):
+        """Startet animierten Fortschrittsbalken (für Operationen ohne messbaren Fortschritt)."""
+        self._progress_bar.config(mode="indeterminate")
+        self._progress_bar.start(12)
+        self._progress_label.config(text=label)
 
-    def _progress_callback(self, table: str, rows_done: int, rows_total: int):
-        self.after(0, self._set_progress, table, rows_done, rows_total)
+    def _progress_start_determinate(self, label: str = ""):
+        """Wechselt zu bestimmbarem Balken und setzt auf 0%."""
+        self._progress_bar.stop()
+        self._progress_bar.config(mode="determinate")
+        self._progress_var.set(0.0)
+        self._progress_label.config(text=label)
+
+    def _progress_finish(self, label: str = "", success: bool = True, auto_reset_ms: int = 3000):
+        """Setzt Balken auf 100% (oder 0% bei Fehler) und plant automatischen Reset."""
+        self._progress_bar.stop()
+        self._progress_bar.config(mode="determinate")
+        self._progress_var.set(100.0 if success else 0.0)
+        self._progress_label.config(text=label)
+        if auto_reset_ms > 0:
+            self.after(auto_reset_ms, self._reset_progress)
 
     def _reset_progress(self):
+        self._progress_bar.stop()
+        self._progress_bar.config(mode="determinate")
         self._progress_var.set(0.0)
         self._progress_label.config(text="")
 
     def _set_progress_label(self, text: str):
         self._progress_label.config(text=text)
+
+    def _set_progress_pct(self, done: int, total: int, label: str = ""):
+        pct = (done / total * 100) if total > 0 else 0
+        self._progress_var.set(pct)
+        if label:
+            self._progress_label.config(text=label)
+
+    def _set_progress(self, table: str, rows_done: int, rows_total: int):
+        """Chunk-Callback für Datenmigration."""
+        pct = (rows_done / rows_total * 100) if rows_total > 0 else 0
+        self._progress_var.set(pct)
+        self._progress_label.config(text=f"{table}: {rows_done:,} / {rows_total:,} Zeilen")
+
+    def _progress_callback(self, table: str, rows_done: int, rows_total: int):
+        self.after(0, self._set_progress, table, rows_done, rows_total)
+
+    def _deploy_progress_callback(self, done: int, total: int):
+        self.after(0, self._set_progress_pct, done, total,
+                   f"DDL: {done}/{total} Anweisungen")
 
     def _set_migration_running(self, running: bool):
         state = "normal" if running else "disabled"
@@ -403,7 +436,7 @@ class App(tk.Tk):
 
         def task():
             self.after(0, self._set_led, self._led_schema, "running")
-            self.after(0, self._set_progress_label, "Schema lesen …")
+            self.after(0, self._progress_start_indeterminate, "Schema lesen …")
             session = None
             try:
                 self.log(f"── Schema lesen: {mdf}")
@@ -412,12 +445,11 @@ class App(tk.Tk):
                 self._schema = read_schema(session, self.log)
                 self.log("Schema erfolgreich gelesen. → DDL generieren klicken.")
                 self.after(0, self._set_led, self._led_schema, "ok")
-                self.after(0, self._set_progress_label, "Schema gelesen ✓")
-                self.after(0, self._progress_var.set, 33.0)
+                self.after(0, self._progress_finish, "Schema gelesen ✓", True, 3000)
             except Exception as e:
                 self.log(f"FEHLER: {e}")
                 self.after(0, self._set_led, self._led_schema, "error")
-                self.after(0, self._set_progress_label, f"Fehler: {e}")
+                self.after(0, self._progress_finish, f"Fehler: {e}", False, 0)
                 self.after(0, messagebox.showerror, "Fehler", str(e))
             finally:
                 if session is not None:
@@ -430,7 +462,7 @@ class App(tk.Tk):
             messagebox.showinfo("Hinweis", "Bitte zuerst 'Schema lesen' ausführen.")
             return
         self._set_led(self._led_ddl, "running")
-        self._set_progress_label("DDL generieren …")
+        self._progress_start_determinate("DDL generieren …")
         try:
             target_db = self.mysql_db.get().strip() or "migrated_db"
             self.log(f"Generiere DDL für Zieldatenbank '{target_db}' …")
@@ -441,12 +473,11 @@ class App(tk.Tk):
             vcount = len(self._schema["views"])
             self.log(f"DDL generiert: {tcount} Tabellen, {vcount} Views. Prüfe Tab '3 · DDL-Vorschau'.")
             self._set_led(self._led_ddl, "ok")
-            self._set_progress_label(f"DDL generiert: {tcount} Tabellen, {vcount} Views ✓")
-            self._progress_var.set(66.0)
+            self._progress_finish(f"DDL: {tcount} Tabellen, {vcount} Views ✓", True, 3000)
         except Exception as e:
             self.log(f"FEHLER DDL: {e}")
             self._set_led(self._led_ddl, "error")
-            self._set_progress_label(f"Fehler: {e}")
+            self._progress_finish(f"Fehler: {e}", False, 0)
 
     def _save_ddl(self):
         ddl = self.ddl_text.get("1.0", "end").strip()
@@ -517,21 +548,21 @@ class App(tk.Tk):
             # ── Schritt 1: DDL deployen (nicht bei Resume oder Dry-Run) ──
             if not resume and not dry_run:
                 self.after(0, self._set_led, self._led_deploy, "running")
-                self.after(0, self._set_progress_label, "DDL wird deployed …")
+                self.after(0, self._progress_start_determinate, "DDL deployen …")
                 try:
                     deploy_to_mysql(
                         ddl,
                         host=host, port=port, user=user,
                         password=password, target_db=target_db,
                         log=self.log,
+                        progress_callback=self._deploy_progress_callback,
                     )
                     self.after(0, self._set_led, self._led_deploy, "ok")
-                    self.after(0, self._set_progress_label, "DDL deployed ✓")
-                    self.after(0, self._progress_var.set, 100.0)
+                    self.after(0, self._progress_finish, "DDL deployed ✓", True, 3000)
                 except Exception as e:
                     self.log(f"FEHLER beim Deployment: {e}")
                     self.after(0, self._set_led, self._led_deploy, "error")
-                    self.after(0, self._set_progress_label, f"Deploy-Fehler: {e}")
+                    self.after(0, self._progress_finish, f"Deploy-Fehler: {e}", False, 0)
                     self.after(0, messagebox.showerror, "Fehler", str(e))
                     return
 
@@ -552,7 +583,7 @@ class App(tk.Tk):
 
             self._stop_event.clear()
             self.after(0, self._set_migration_running, True)
-            self.after(0, self._reset_progress)
+            self.after(0, self._progress_start_determinate, "Datenmigration startet …")
 
             session = None
             try:
@@ -566,6 +597,7 @@ class App(tk.Tk):
                     database=target_db, charset="utf8mb4", connection_timeout=10,
                 )
                 self.after(0, self._set_led, self._led_deploy, "running")
+                self.after(0, self._progress_start_determinate, "Daten migrieren …")
                 result = migrate_all(
                     session, mysql_conn, tables, self.log,
                     chunk_size=CHUNK_SIZE,
@@ -578,29 +610,29 @@ class App(tk.Tk):
                 if dry_run:
                     self.log("✓ Dry-Run abgeschlossen – keine Daten geschrieben.")
                     self.after(0, self._set_led, self._led_deploy, "ok")
-                    self.after(0, self._set_progress_label, "Dry-Run abgeschlossen ✓")
+                    self.after(0, self._progress_finish, "Dry-Run abgeschlossen ✓", True, 3000)
                 elif result["cancelled"]:
                     self.log(f"⚠ Migration abgebrochen: {result['total_rows']:,} Zeilen importiert.")
                     self.after(0, self._set_led, self._led_deploy, "error")
-                    self.after(0, self._set_progress_label, f"Abgebrochen – {result['total_rows']:,} Zeilen")
+                    self.after(0, self._progress_finish,
+                               f"Abgebrochen – {result['total_rows']:,} Zeilen", False, 0)
                 elif result["errors"]:
                     self.log(f"✓ Datenmigration: {result['total_rows']:,} Zeilen, {len(result['errors'])} Fehler.")
                     self.after(0, self._set_led, self._led_deploy, "error")
-                    self.after(0, self._set_progress_label,
-                               f"{result['total_rows']:,} Zeilen – {len(result['errors'])} Fehler")
+                    self.after(0, self._progress_finish,
+                               f"{result['total_rows']:,} Zeilen – {len(result['errors'])} Fehler", False, 0)
                     for err in result["errors"]:
                         self.log(f"  ⚠ {err}")
                 else:
                     self.log(f"✓ Datenmigration abgeschlossen: {result['total_rows']:,} Zeilen importiert.")
                     self.after(0, self._set_led, self._led_deploy, "ok")
-                    self.after(0, self._set_progress_label,
-                               f"Migration abgeschlossen: {result['total_rows']:,} Zeilen ✓")
-                    self.after(0, self._progress_var.set, 100.0)
+                    self.after(0, self._progress_finish,
+                               f"Migration: {result['total_rows']:,} Zeilen ✓", True, 3000)
                 self.after(0, self._refresh_resume_btn)
             except Exception as e:
                 self.log(f"FEHLER Datenmigration: {e}")
                 self.after(0, self._set_led, self._led_deploy, "error")
-                self.after(0, self._set_progress_label, f"Fehler: {e}")
+                self.after(0, self._progress_finish, f"Fehler: {e}", False, 0)
                 self.after(0, messagebox.showerror, "Fehler Datenmigration", str(e))
             finally:
                 if session is not None:
