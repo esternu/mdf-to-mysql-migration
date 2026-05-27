@@ -29,3 +29,4 @@ if errorlevel 1 (
 
 :: Tool starten (kein Konsolenfenster im Hintergrund)
 start "" py mdf_to_mysql.py
+

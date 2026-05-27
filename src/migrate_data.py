@@ -13,6 +13,9 @@ Die Orchestrierung (Verbindungsaufbau, Konfiguration, Logging in Datei)
 """
 from __future__ import annotations
 
+import datetime
+import json
+import os
 import threading
 from typing import Callable, Dict, Generator, List, Optional, Tuple, Any
 
@@ -192,7 +195,47 @@ def migrate_table(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  5) Alle Tabellen migrieren
+#  5) Checkpoint-Hilfsfunktionen
+# ════════════════════════════════════════════════════════════════════════════
+def load_checkpoint(checkpoint_file: str) -> Dict[str, object]:
+    """Liest Checkpoint-Datei; gibt leeres Dict zurück wenn nicht vorhanden."""
+    if checkpoint_file and os.path.isfile(checkpoint_file):
+        try:
+            with open(checkpoint_file, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            pass
+    return {"completed": [], "started_at": None}
+
+
+def save_checkpoint(checkpoint_file: str, completed: List[str], started_at: str) -> None:
+    """Schreibt Checkpoint-Datei atomar."""
+    if not checkpoint_file:
+        return
+    data = {"completed": completed, "started_at": started_at}
+    tmp  = checkpoint_file + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, checkpoint_file)
+
+
+def delete_checkpoint(checkpoint_file: str) -> None:
+    """Löscht Checkpoint-Datei nach erfolgreichem Abschluss."""
+    if checkpoint_file and os.path.isfile(checkpoint_file):
+        try:
+            os.remove(checkpoint_file)
+        except Exception:
+            pass
+
+
+def checkpoint_exists(checkpoint_file: str) -> bool:
+    """Gibt True zurück wenn eine Checkpoint-Datei mit abgeschlossenen Tabellen existiert."""
+    cp = load_checkpoint(checkpoint_file)
+    return bool(cp.get("completed"))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  6) Alle Tabellen migrieren (mit Dry-Run und Checkpoint)
 # ════════════════════════════════════════════════════════════════════════════
 def migrate_all(
     session,
@@ -202,17 +245,29 @@ def migrate_all(
     chunk_size:        int = CHUNK_SIZE,
     progress_callback: Optional[ProgressFn] = None,
     stop_event:        Optional[threading.Event] = None,
+    dry_run:           bool = False,
+    checkpoint_file:   Optional[str] = None,
 ) -> dict:
     """Migriert alle übergebenen Tabellen von SQL Server nach MySQL.
+
+    Parameters
+    ----------
+    dry_run : bool
+        Wenn True: Zeilenzahlen loggen, aber kein TRUNCATE/INSERT ausführen.
+    checkpoint_file : str | None
+        Pfad zur Checkpoint-JSON-Datei. Bereits migrierte Tabellen werden
+        übersprungen; nach jeder Tabelle wird der Fortschritt gespeichert.
+        Nach erfolgreichem Abschluss wird die Datei gelöscht.
 
     Returns
     -------
     dict mit Schlüsseln:
         "total_rows"   – Gesamtzahl importierter Zeilen (int)
-        "skipped"      – Namen leerer Tabellen (list of str)
+        "skipped"      – Namen leerer/übersprungener Tabellen (list of str)
         "errors"       – Fehlermeldungen (list of str)
         "migrated"     – Zeilenzahl pro Tabelle {table: count} (dict)
         "cancelled"    – True wenn durch stop_event abgebrochen (bool)
+        "dry_run"      – True wenn Dry-Run-Modus aktiv war (bool)
     """
     result = {
         "total_rows": 0,
@@ -220,10 +275,31 @@ def migrate_all(
         "errors":     [],
         "migrated":   {},
         "cancelled":  False,
+        "dry_run":    dry_run,
     }
 
-    row_counts = get_row_counts(session, tables)
+    row_counts  = get_row_counts(session, tables)
+    started_at  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # ── Checkpoint laden ──────────────────────────────────────────────────
+    cp          = load_checkpoint(checkpoint_file)
+    completed   = list(cp.get("completed") or [])
+    if completed:
+        log(f"  Checkpoint: {len(completed)} Tabellen bereits migriert – werden übersprungen.")
+
+    # ── Dry-Run: nur Übersicht loggen ─────────────────────────────────────
+    if dry_run:
+        log("── Dry-Run: kein Schreiben, nur Vorschau ──")
+        total_rows = 0
+        for schema, tname in tables:
+            cnt = row_counts.get(tname, 0)
+            total_rows += cnt
+            status = "✓ bereits migriert" if tname in completed else f"~{cnt:,} Zeilen"
+            log(f"  {tname}: {status}")
+        log(f"── Gesamt: {len(tables)} Tabellen, ~{total_rows:,} Zeilen ──")
+        return result
+
+    # ── Echte Migration ───────────────────────────────────────────────────
     mysql_conn.cursor().execute("SET FOREIGN_KEY_CHECKS = 0")
     mysql_conn.commit()
 
@@ -233,7 +309,13 @@ def migrate_all(
             log(f"⚠ Migration abgebrochen nach {idx - 1}/{len(tables)} Tabellen.")
             break
 
-        log(f"  [{idx}/{len(tables)}] {tname} (~{row_counts.get(tname, 0)} Zeilen) …")
+        # Bereits abgeschlossene Tabellen überspringen
+        if tname in completed:
+            log(f"  [{idx}/{len(tables)}] {tname}: übersprungen (Checkpoint) ✓")
+            result["skipped"].append(tname)
+            continue
+
+        log(f"  [{idx}/{len(tables)}] {tname} (~{row_counts.get(tname, 0):,} Zeilen) …")
 
         try:
             count = migrate_table(
@@ -246,6 +328,11 @@ def migrate_all(
             else:
                 result["migrated"][tname] = count
                 result["total_rows"] += count
+
+            # Checkpoint aktualisieren (auch leere Tabellen als abgeschlossen markieren)
+            completed.append(tname)
+            save_checkpoint(checkpoint_file, completed, started_at)
+
         except Exception as exc:
             msg = f"{tname}: {exc}"
             result["errors"].append(msg)
@@ -257,5 +344,11 @@ def migrate_all(
 
     mysql_conn.cursor().execute("SET FOREIGN_KEY_CHECKS = 1")
     mysql_conn.commit()
+
+    # Checkpoint löschen wenn alles fehlerfrei abgeschlossen
+    if not result["cancelled"] and not result["errors"]:
+        delete_checkpoint(checkpoint_file)
+        if checkpoint_file:
+            log("  Checkpoint gelöscht (Migration vollständig).")
 
     return result

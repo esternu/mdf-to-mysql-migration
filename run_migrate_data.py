@@ -3,6 +3,7 @@ Runner: SQL Server (MDF) → MySQL Datenmigration.
 Liest Einstellungen aus config.json (erstes Profil),
 baut Verbindungen auf und delegiert an src/migrate_data.py.
 """
+import argparse
 import sys
 import os
 import io
@@ -17,7 +18,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="repla
 _DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_DIR, "src"))
 
-from paths        import CFG_FILE, LOG_DIR
+from paths        import CFG_FILE, LOG_DIR, CHECKPOINT_FILE
 from mssql        import attach_mdf, detach_and_cleanup
 from migrate_data import get_table_list, migrate_all
 
@@ -26,6 +27,12 @@ try:
 except ImportError:
     print("FEHLER: mysql-connector-python fehlt. Bitte: py -m pip install mysql-connector-python")
     sys.exit(1)
+
+# ── CLI-Argumente ─────────────────────────────────────────────────────────────
+_parser = argparse.ArgumentParser(description="MDF → MySQL Datenmigration")
+_parser.add_argument("--dry-run",  action="store_true", help="Nur Vorschau, keine Daten schreiben")
+_parser.add_argument("--resume",   action="store_true", help="Migration von Checkpoint fortsetzen")
+_args = _parser.parse_args()
 
 # ── Log ───────────────────────────────────────────────────────────────────────
 _LOG_FILE = os.path.join(
@@ -95,8 +102,13 @@ except Exception as e:
 
 # ── Migrieren ─────────────────────────────────────────────────────────────────
 log("")
-log("── Schritt 4: Daten migrieren")
-result = migrate_all(session, mysql_conn, tables, log)
+mode = "Dry-Run Vorschau" if _args.dry_run else ("Resume" if _args.resume else "Daten migrieren")
+log(f"── Schritt 4: {mode}")
+result = migrate_all(
+    session, mysql_conn, tables, log,
+    dry_run=_args.dry_run,
+    checkpoint_file=CHECKPOINT_FILE,
+)
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 mysql_conn.close()
