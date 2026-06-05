@@ -247,8 +247,9 @@ def migrate_all(
     stop_event:        Optional[threading.Event] = None,
     dry_run:           bool = False,
     checkpoint_file:   Optional[str] = None,
+    tables_whitelist:  Optional[set] = None,
 ) -> dict:
-    """Migriert alle übergebenen Tabellen von SQL Server nach MySQL.
+    """Migriert Tabellen von SQL Server nach MySQL.
 
     Parameters
     ----------
@@ -258,6 +259,10 @@ def migrate_all(
         Pfad zur Checkpoint-JSON-Datei. Bereits migrierte Tabellen werden
         übersprungen; nach jeder Tabelle wird der Fortschritt gespeichert.
         Nach erfolgreichem Abschluss wird die Datei gelöscht.
+    tables_whitelist : set | None
+        Wenn angegeben (set mit Tabellennamen in Kleinbuchstaben), werden nur
+        diese Tabellen migriert. Alle anderen werden übersprungen.
+        None bedeutet: alle Tabellen migrieren.
 
     Returns
     -------
@@ -294,9 +299,15 @@ def migrate_all(
         for schema, tname in tables:
             cnt = row_counts.get(tname, 0)
             total_rows += cnt
-            status = "✓ bereits migriert" if tname in completed else f"~{cnt:,} Zeilen"
+            if tables_whitelist is not None and tname.lower() not in tables_whitelist:
+                status = "– übersprungen (nicht in Diff)"
+            elif tname in completed:
+                status = "✓ bereits migriert"
+            else:
+                status = f"~{cnt:,} Zeilen"
             log(f"  {tname}: {status}")
-        log(f"── Gesamt: {len(tables)} Tabellen, ~{total_rows:,} Zeilen ──")
+        active = len(tables) if tables_whitelist is None else len(tables_whitelist)
+        log(f"── Gesamt: {active} Tabellen aktiv, ~{total_rows:,} Zeilen ──")
         return result
 
     # ── Echte Migration ───────────────────────────────────────────────────
@@ -308,6 +319,12 @@ def migrate_all(
             result["cancelled"] = True
             log(f"⚠ Migration abgebrochen nach {idx - 1}/{len(tables)} Tabellen.")
             break
+
+        # Whitelist-Filter: Tabellen überspringen die nicht im Diff sind
+        if tables_whitelist is not None and tname.lower() not in tables_whitelist:
+            log(f"  [{idx}/{len(tables)}] {tname}: übersprungen (nicht in Schema-Diff) ✓")
+            result["skipped"].append(tname)
+            continue
 
         # Bereits abgeschlossene Tabellen überspringen
         if tname in completed:

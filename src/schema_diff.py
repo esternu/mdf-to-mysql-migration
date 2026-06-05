@@ -403,6 +403,29 @@ def generate_diff_ddl(diff: dict, source_schema: dict, target_db: str) -> Tuple[
 #  Diff-Zusammenfassung als Text (für Log / Dry-Run-Preview)
 # ════════════════════════════════════════════════════════════════════════════
 
+def get_tables_to_refresh(diff: dict) -> set:
+    """Gibt die Tabellennamen (Kleinbuchstaben) zurück, deren Daten neu geladen
+    werden sollten, basierend auf dem Schema-Diff.
+
+    Regeln:
+      - Neue Tabellen:          leer → Daten laden (kein TRUNCATE nötig)
+      - Typ-Änderung einer Spalte:    Daten könnten inkompatibel sein → neu laden
+      - Neue Spalte:            Daten aus MDF können neue Spalte befüllen → neu laden
+      - Nur neue Indexes / FKs: Daten unverändert gültig → KEIN Reload
+      - Entfernte Tabellen/Spalten:   werden nicht berührt
+    """
+    tables: set = set()
+
+    for tinfo in diff.get("new_tables", []):
+        tables.add(tinfo["name"].lower())
+
+    for tname, changes in diff.get("altered_tables", {}).items():
+        if changes.get("new_columns") or changes.get("modified_columns"):
+            tables.add(tname.lower())
+
+    return tables
+
+
 def format_diff_summary(diff: dict) -> str:
     """Gibt eine lesbare Zusammenfassung des Diffs zurück."""
     lines = []

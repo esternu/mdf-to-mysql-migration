@@ -21,7 +21,8 @@ from deploy       import deploy_to_mysql, MYSQL_OK
 from migrate_data import (get_table_list, migrate_all, CHUNK_SIZE,
                           checkpoint_exists, delete_checkpoint, load_checkpoint)
 from schema_diff  import (read_mysql_schema, diff_schemas,
-                          generate_diff_ddl, format_diff_summary)
+                          generate_diff_ddl, format_diff_summary,
+                          get_tables_to_refresh)
 
 try:
     import mysql.connector
@@ -107,10 +108,23 @@ class App(tk.Tk):
         ttk.Checkbutton(btn_frame, text="Schema-Diff (inkrementell)",
                         variable=self._incremental_var).pack(side="left", padx=(0, 2))
 
-        # Checkboxen
+        # Daten-Modus: Checkbox + OptionMenu (Alle / Nur geänderte)
         self._transfer_data_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(btn_frame, text="Daten übertragen",
-                        variable=self._transfer_data_var).pack(side="left", padx=(8, 2))
+                        variable=self._transfer_data_var,
+                        command=self._refresh_data_scope_state).pack(side="left", padx=(8, 2))
+        # "Alle" = alle Tabellen neu befüllen (TRUNCATE+INSERT)
+        # "Nur geänderte" = nur Tabellen aus Schema-Diff (neue + geänderte Spalten)
+        self._data_scope_var = tk.StringVar(value="diff")
+        self._data_scope_menu = ttk.OptionMenu(
+            btn_frame, self._data_scope_var,
+            "diff",
+            "diff",   "Nur geänderte",
+            "all",    "Alle Tabellen",
+        )
+        self._data_scope_menu.configure(width=13)
+        self._data_scope_menu.pack(side="left", padx=(0, 2))
+
         self._dry_run_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(btn_frame, text="Dry-Run",
                         variable=self._dry_run_var).pack(side="left", padx=(4, 2))
@@ -356,6 +370,11 @@ class App(tk.Tk):
         self._stop_event.set()
         self.log("⚠ Abbruch angefordert …")
 
+    def _refresh_data_scope_state(self):
+        """OptionMenu für Daten-Scope aktivieren/deaktivieren je nach Checkbox."""
+        state = "normal" if self._transfer_data_var.get() else "disabled"
+        self._data_scope_menu.configure(state=state)
+
     def _refresh_resume_btn(self):
         """Resume-Button aktivieren wenn Checkpoint-Datei existiert."""
         if checkpoint_exists(CHECKPOINT_FILE):
@@ -534,6 +553,7 @@ class App(tk.Tk):
 
         dry_run     = self._dry_run_var.get()
         incremental = self._incremental_var.get()
+        data_scope  = self._data_scope_var.get()   # "all" oder "diff"
 
         # Inkrementell: Schema aus MDF erforderlich
         if incremental and not hasattr(self, "_schema"):
@@ -577,6 +597,9 @@ class App(tk.Tk):
         target_db = self.mysql_db.get().strip()
 
         def task():
+            # diff_result wird ggf. in Schritt 1 befüllt und in Schritt 2 genutzt
+            diff_result = None
+
             # ══════════════════════════════════════════════════════════════
             # Schritt 1: Schema-DDL deployen
             # ══════════════════════════════════════════════════════════════
@@ -595,20 +618,20 @@ class App(tk.Tk):
                         mysql_schema = read_mysql_schema(mysql_conn_schema, target_db)
                         mysql_conn_schema.close()
 
-                        diff = diff_schemas(self._schema, mysql_schema)
-                        summary = format_diff_summary(diff)
+                        diff_result = diff_schemas(self._schema, mysql_schema)
+                        summary = format_diff_summary(diff_result)
                         self.log("── Schema-Diff Ergebnis:")
                         self.log(summary)
 
-                        if diff["warnings"]:
+                        if diff_result["warnings"]:
                             self.log("⚠ Warnungen:")
-                            for w in diff["warnings"]:
+                            for w in diff_result["warnings"]:
                                 self.log(f"  {w}")
 
                         # Kein Änderungsbedarf?
                         no_changes = (
-                            not diff["new_tables"]
-                            and not diff["altered_tables"]
+                            not diff_result["new_tables"]
+                            and not diff_result["altered_tables"]
                         )
                         if no_changes:
                             self.log("✓ Schema ist bereits aktuell – kein Deploy nötig.")
@@ -617,21 +640,24 @@ class App(tk.Tk):
                             if dry_run or not self._transfer_data_var.get():
                                 return
                         elif dry_run:
+                            # Dry-Run: Diff + Datenvorschau anzeigen
+                            if self._transfer_data_var.get():
+                                refresh_set = get_tables_to_refresh(diff_result)
+                                if data_scope == "diff":
+                                    self.log(f"── Dry-Run Daten: {len(refresh_set)} Tabellen würden neu geladen:")
+                                    for t in sorted(refresh_set):
+                                        self.log(f"  → {t}")
+                                else:
+                                    self.log("── Dry-Run Daten: alle Tabellen würden neu geladen (Alle-Modus)")
                             self.log("✓ Dry-Run: Schema-Diff angezeigt – keine Änderungen ausgeführt.")
                             self.after(0, self._set_led, self._led_deploy, "ok")
                             self.after(0, self._progress_finish, "Dry-Run: Diff OK ✓", True, 3000)
-                            if not self._transfer_data_var.get():
-                                return
+                            return
                         else:
-                            diff_ddl, _ = generate_diff_ddl(diff, self._schema, target_db)
-                            # Diff-DDL auch im DDL-Tab anzeigen
+                            diff_ddl, _ = generate_diff_ddl(diff_result, self._schema, target_db)
                             self.after(0, self._show_diff_ddl, diff_ddl)
 
                             self.after(0, self._progress_start_determinate, "Schema-Diff deployen …")
-                            mysql_conn_deploy = mysql.connector.connect(
-                                host=host, port=port, user=user, password=password,
-                                database=target_db, charset="utf8mb4", connection_timeout=10,
-                            )
                             deploy_to_mysql(
                                 diff_ddl,
                                 host=host, port=port, user=user,
@@ -639,7 +665,6 @@ class App(tk.Tk):
                                 log=self.log,
                                 progress_callback=self._deploy_progress_callback,
                             )
-                            mysql_conn_deploy.close()
                             self.log("✓ Schema-Diff erfolgreich deployt – Daten erhalten.")
                             self.after(0, self._set_led, self._led_deploy, "ok")
                             self.after(0, self._progress_finish, "Schema-Diff deployed ✓", True, 3000)
@@ -708,6 +733,33 @@ class App(tk.Tk):
                     host=host, port=port, user=user, password=password,
                     database=target_db, charset="utf8mb4", connection_timeout=10,
                 )
+                # Whitelist bestimmen
+                tables_whitelist = None
+                if data_scope == "diff" and not resume:
+                    if diff_result is None and incremental and hasattr(self, "_schema"):
+                        # Diff noch nicht berechnet (z.B. Schema bereits aktuell)
+                        try:
+                            mc_tmp = mysql.connector.connect(
+                                host=host, port=port, user=user, password=password,
+                                database=target_db, charset="utf8mb4", connection_timeout=10,
+                            )
+                            diff_result = diff_schemas(
+                                self._schema, read_mysql_schema(mc_tmp, target_db)
+                            )
+                            mc_tmp.close()
+                        except Exception:
+                            pass
+                    if diff_result is not None:
+                        tables_whitelist = get_tables_to_refresh(diff_result)
+                        self.log(f"  Daten-Scope: Nur geänderte Tabellen ({len(tables_whitelist)})")
+                        for t in sorted(tables_whitelist):
+                            self.log(f"    → {t}")
+                    else:
+                        self.log("  Daten-Scope: Diff nicht verfügbar – alle Tabellen werden migriert.")
+                else:
+                    if not resume:
+                        self.log("  Daten-Scope: Alle Tabellen werden neu befüllt.")
+
                 self.after(0, self._set_led, self._led_deploy, "running")
                 self.after(0, self._progress_start_determinate, "Daten migrieren …")
                 result = migrate_all(
@@ -717,6 +769,7 @@ class App(tk.Tk):
                     stop_event=self._stop_event,
                     dry_run=dry_run,
                     checkpoint_file=CHECKPOINT_FILE,
+                    tables_whitelist=tables_whitelist,
                 )
                 mysql_conn.close()
                 if dry_run:
