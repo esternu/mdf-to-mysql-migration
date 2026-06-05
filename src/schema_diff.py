@@ -40,13 +40,17 @@ def read_mysql_schema(conn, db_name: str) -> Dict[str, Any]:
     cur = conn.cursor()
     schema: Dict[str, Any] = {"tables": {}}
 
-    # ── Tabellen + Spalten ────────────────────────────────────────────────
+    # ── Tabellen + Spalten (nur BASE TABLE, keine Views) ─────────────────
     cur.execute("""
-        SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE,
-               COLUMN_DEFAULT, EXTRA, ORDINAL_POSITION
-        FROM   INFORMATION_SCHEMA.COLUMNS
-        WHERE  TABLE_SCHEMA = %s
-        ORDER  BY TABLE_NAME, ORDINAL_POSITION
+        SELECT c.TABLE_NAME, c.COLUMN_NAME, c.COLUMN_TYPE, c.IS_NULLABLE,
+               c.COLUMN_DEFAULT, c.EXTRA, c.ORDINAL_POSITION
+        FROM   INFORMATION_SCHEMA.COLUMNS c
+        JOIN   INFORMATION_SCHEMA.TABLES  t
+               ON  t.TABLE_NAME   = c.TABLE_NAME
+               AND t.TABLE_SCHEMA = c.TABLE_SCHEMA
+        WHERE  c.TABLE_SCHEMA = %s
+          AND  t.TABLE_TYPE   = 'BASE TABLE'
+        ORDER  BY c.TABLE_NAME, c.ORDINAL_POSITION
     """, (db_name,))
 
     for tname, cname, ctype, nullable, default, extra, _ in cur.fetchall():
@@ -64,24 +68,33 @@ def read_mysql_schema(conn, db_name: str) -> Dict[str, Any]:
             "auto_increment": ("auto_increment" in (extra or "").lower()),
         }
 
-    # ── Primary Keys ──────────────────────────────────────────────────────
+    # ── Primary Keys (nur BASE TABLE) ────────────────────────────────────
     cur.execute("""
-        SELECT TABLE_NAME, COLUMN_NAME
-        FROM   INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-        WHERE  TABLE_SCHEMA = %s AND CONSTRAINT_NAME = 'PRIMARY'
-        ORDER  BY TABLE_NAME, ORDINAL_POSITION
+        SELECT kcu.TABLE_NAME, kcu.COLUMN_NAME
+        FROM   INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+        JOIN   INFORMATION_SCHEMA.TABLES t
+               ON  t.TABLE_NAME   = kcu.TABLE_NAME
+               AND t.TABLE_SCHEMA = kcu.TABLE_SCHEMA
+        WHERE  kcu.TABLE_SCHEMA    = %s
+          AND  kcu.CONSTRAINT_NAME = 'PRIMARY'
+          AND  t.TABLE_TYPE        = 'BASE TABLE'
+        ORDER  BY kcu.TABLE_NAME, kcu.ORDINAL_POSITION
     """, (db_name,))
     for tname, cname in cur.fetchall():
         if tname in schema["tables"]:
             schema["tables"][tname]["pk"].append(cname)
 
-    # ── Indexes (ohne PK und FK) ──────────────────────────────────────────
+    # ── Indexes (ohne PK und FK, nur BASE TABLE) ─────────────────────────
     cur.execute("""
-        SELECT TABLE_NAME, INDEX_NAME, NON_UNIQUE, COLUMN_NAME, SEQ_IN_INDEX
-        FROM   INFORMATION_SCHEMA.STATISTICS
-        WHERE  TABLE_SCHEMA = %s
-          AND  INDEX_NAME  != 'PRIMARY'
-        ORDER  BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX
+        SELECT s.TABLE_NAME, s.INDEX_NAME, s.NON_UNIQUE, s.COLUMN_NAME, s.SEQ_IN_INDEX
+        FROM   INFORMATION_SCHEMA.STATISTICS s
+        JOIN   INFORMATION_SCHEMA.TABLES t
+               ON  t.TABLE_NAME   = s.TABLE_NAME
+               AND t.TABLE_SCHEMA = s.TABLE_SCHEMA
+        WHERE  s.TABLE_SCHEMA = %s
+          AND  s.INDEX_NAME  != 'PRIMARY'
+          AND  t.TABLE_TYPE   = 'BASE TABLE'
+        ORDER  BY s.TABLE_NAME, s.INDEX_NAME, s.SEQ_IN_INDEX
     """, (db_name,))
     for tname, iname, non_unique, cname, _ in cur.fetchall():
         if tname not in schema["tables"]:
