@@ -20,6 +20,8 @@ from transform    import generate_mysql_ddl
 from deploy       import deploy_to_mysql, MYSQL_OK
 from migrate_data import (get_table_list, migrate_all, CHUNK_SIZE,
                           checkpoint_exists, delete_checkpoint, load_checkpoint)
+from schema_diff  import (read_mysql_schema, diff_schemas,
+                          generate_diff_ddl, format_diff_summary)
 
 try:
     import mysql.connector
@@ -99,6 +101,11 @@ class App(tk.Tk):
         self._led_deploy = self._make_led(btn_frame)
         self._led_deploy.pack(side="left", padx=(4, 2), pady=4)
         ttk.Button(btn_frame, text="▶ Auf MySQL deployen", command=self._deploy).pack(side="left", padx=(0, 4))
+
+        # Deploy-Modus: inkrementell (ALTER TABLE) oder vollständig (DROP+CREATE)
+        self._incremental_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(btn_frame, text="Schema-Diff (inkrementell)",
+                        variable=self._incremental_var).pack(side="left", padx=(0, 2))
 
         # Checkboxen
         self._transfer_data_var = tk.BooleanVar(value=False)
@@ -524,17 +531,42 @@ class App(tk.Tk):
                 "mysql-connector-python nicht installiert.\npip install mysql-connector-python",
             )
             return
-        ddl = self.ddl_text.get("1.0", "end").strip()
-        if not ddl:
-            messagebox.showinfo("Hinweis", "DDL-Vorschau ist leer. Bitte zuerst DDL generieren.")
+
+        dry_run     = self._dry_run_var.get()
+        incremental = self._incremental_var.get()
+
+        # Inkrementell: Schema aus MDF erforderlich
+        if incremental and not hasattr(self, "_schema"):
+            messagebox.showinfo(
+                "Hinweis",
+                "Schema-Diff-Modus: Bitte zuerst 'Schema lesen' ausführen.",
+            )
             return
 
-        dry_run = self._dry_run_var.get()
-        if not dry_run and not resume:
+        # Vollständig: DDL-Tab muss befüllt sein
+        if not incremental:
+            ddl = self.ddl_text.get("1.0", "end").strip()
+            if not ddl:
+                messagebox.showinfo("Hinweis", "DDL-Vorschau ist leer. Bitte zuerst DDL generieren.")
+                return
+
+        if not dry_run and not resume and not incremental:
             if not messagebox.askyesno(
-                "Deployment bestätigen",
-                f"DDL auf {self.mysql_host.get()}:{self.mysql_port.get()}\n"
-                f"Datenbank: {self.mysql_db.get()}\n\nJetzt ausführen?",
+                "Vollständiges Deployment bestätigen",
+                f"ACHTUNG: DROP TABLE + CREATE TABLE auf\n"
+                f"{self.mysql_host.get()}:{self.mysql_port.get()} / {self.mysql_db.get()}\n\n"
+                f"Alle bestehenden Daten in der Zieldatenbank werden gelöscht!\n\n"
+                f"Jetzt ausführen?",
+            ):
+                return
+        elif not dry_run and not resume and incremental:
+            if not messagebox.askyesno(
+                "Schema-Diff deployen",
+                f"Inkrementelles Schema-Update auf\n"
+                f"{self.mysql_host.get()}:{self.mysql_port.get()} / {self.mysql_db.get()}\n\n"
+                f"Bestehende Daten bleiben erhalten.\n"
+                f"Nur neue Tabellen/Spalten/Indexes werden angelegt.\n\n"
+                f"Jetzt ausführen?",
             ):
                 return
 
@@ -545,32 +577,112 @@ class App(tk.Tk):
         target_db = self.mysql_db.get().strip()
 
         def task():
-            # ── Schritt 1: DDL deployen (nicht bei Resume oder Dry-Run) ──
-            if not resume and not dry_run:
+            # ══════════════════════════════════════════════════════════════
+            # Schritt 1: Schema-DDL deployen
+            # ══════════════════════════════════════════════════════════════
+            if not resume:
                 self.after(0, self._set_led, self._led_deploy, "running")
-                self.after(0, self._progress_start_determinate, "DDL deployen …")
-                try:
-                    deploy_to_mysql(
-                        ddl,
-                        host=host, port=port, user=user,
-                        password=password, target_db=target_db,
-                        log=self.log,
-                        progress_callback=self._deploy_progress_callback,
-                    )
-                    self.after(0, self._set_led, self._led_deploy, "ok")
-                    self.after(0, self._progress_finish, "DDL deployed ✓", True, 3000)
-                except Exception as e:
-                    self.log(f"FEHLER beim Deployment: {e}")
-                    self.after(0, self._set_led, self._led_deploy, "error")
-                    self.after(0, self._progress_finish, f"Deploy-Fehler: {e}", False, 0)
-                    self.after(0, messagebox.showerror, "Fehler", str(e))
-                    return
 
-            # ── Schritt 2: Daten übertragen (optional) ───────────────────
-            if not self._transfer_data_var.get() and not resume and not dry_run:
-                return
-            if dry_run and not self._transfer_data_var.get():
-                self.log("ℹ Dry-Run: 'Daten übertragen' nicht aktiviert – nur DDL-Vorschau.")
+                if incremental:
+                    # ── Inkrementell: Diff berechnen und deployen ─────────
+                    self.after(0, self._progress_start_indeterminate, "Schema-Diff berechnen …")
+                    try:
+                        mysql_conn_schema = mysql.connector.connect(
+                            host=host, port=port, user=user, password=password,
+                            database=target_db, charset="utf8mb4", connection_timeout=10,
+                        )
+                        self.log("── Schema-Diff: Lese MySQL-Schema …")
+                        mysql_schema = read_mysql_schema(mysql_conn_schema, target_db)
+                        mysql_conn_schema.close()
+
+                        diff = diff_schemas(self._schema, mysql_schema)
+                        summary = format_diff_summary(diff)
+                        self.log("── Schema-Diff Ergebnis:")
+                        self.log(summary)
+
+                        if diff["warnings"]:
+                            self.log("⚠ Warnungen:")
+                            for w in diff["warnings"]:
+                                self.log(f"  {w}")
+
+                        # Kein Änderungsbedarf?
+                        no_changes = (
+                            not diff["new_tables"]
+                            and not diff["altered_tables"]
+                        )
+                        if no_changes:
+                            self.log("✓ Schema ist bereits aktuell – kein Deploy nötig.")
+                            self.after(0, self._set_led, self._led_deploy, "ok")
+                            self.after(0, self._progress_finish, "Schema aktuell ✓", True, 3000)
+                            if dry_run or not self._transfer_data_var.get():
+                                return
+                        elif dry_run:
+                            self.log("✓ Dry-Run: Schema-Diff angezeigt – keine Änderungen ausgeführt.")
+                            self.after(0, self._set_led, self._led_deploy, "ok")
+                            self.after(0, self._progress_finish, "Dry-Run: Diff OK ✓", True, 3000)
+                            if not self._transfer_data_var.get():
+                                return
+                        else:
+                            diff_ddl, _ = generate_diff_ddl(diff, self._schema, target_db)
+                            # Diff-DDL auch im DDL-Tab anzeigen
+                            self.after(0, self._show_diff_ddl, diff_ddl)
+
+                            self.after(0, self._progress_start_determinate, "Schema-Diff deployen …")
+                            mysql_conn_deploy = mysql.connector.connect(
+                                host=host, port=port, user=user, password=password,
+                                database=target_db, charset="utf8mb4", connection_timeout=10,
+                            )
+                            deploy_to_mysql(
+                                diff_ddl,
+                                host=host, port=port, user=user,
+                                password=password, target_db=target_db,
+                                log=self.log,
+                                progress_callback=self._deploy_progress_callback,
+                            )
+                            mysql_conn_deploy.close()
+                            self.log("✓ Schema-Diff erfolgreich deployt – Daten erhalten.")
+                            self.after(0, self._set_led, self._led_deploy, "ok")
+                            self.after(0, self._progress_finish, "Schema-Diff deployed ✓", True, 3000)
+
+                    except Exception as e:
+                        self.log(f"FEHLER Schema-Diff: {e}")
+                        self.after(0, self._set_led, self._led_deploy, "error")
+                        self.after(0, self._progress_finish, f"Fehler: {e}", False, 0)
+                        self.after(0, messagebox.showerror, "Fehler Schema-Diff", str(e))
+                        return
+
+                else:
+                    # ── Vollständig: DROP + CREATE (bisheriges Verhalten) ─
+                    if dry_run:
+                        self.log("ℹ Dry-Run + Vollständig: DDL-Vorschau im Tab '3 · DDL-Vorschau'.")
+                        self.after(0, self._set_led, self._led_deploy, "ok")
+                        self.after(0, self._progress_finish, "Dry-Run: DDL bereit ✓", True, 3000)
+                        if not self._transfer_data_var.get():
+                            return
+                    else:
+                        ddl = self.ddl_text.get("1.0", "end").strip()
+                        self.after(0, self._progress_start_determinate, "DDL deployen …")
+                        try:
+                            deploy_to_mysql(
+                                ddl,
+                                host=host, port=port, user=user,
+                                password=password, target_db=target_db,
+                                log=self.log,
+                                progress_callback=self._deploy_progress_callback,
+                            )
+                            self.after(0, self._set_led, self._led_deploy, "ok")
+                            self.after(0, self._progress_finish, "DDL deployed ✓", True, 3000)
+                        except Exception as e:
+                            self.log(f"FEHLER beim Deployment: {e}")
+                            self.after(0, self._set_led, self._led_deploy, "error")
+                            self.after(0, self._progress_finish, f"Deploy-Fehler: {e}", False, 0)
+                            self.after(0, messagebox.showerror, "Fehler", str(e))
+                            return
+
+            # ══════════════════════════════════════════════════════════════
+            # Schritt 2: Daten übertragen (optional)
+            # ══════════════════════════════════════════════════════════════
+            if not self._transfer_data_var.get() and not resume:
                 return
 
             self.log("")
@@ -640,6 +752,11 @@ class App(tk.Tk):
                 self.after(0, self._set_migration_running, False)
 
         threading.Thread(target=task, daemon=True).start()
+
+    def _show_diff_ddl(self, ddl: str):
+        """Zeigt das Diff-DDL im DDL-Tab an (thread-safe via after())."""
+        self.ddl_text.delete("1.0", "end")
+        self.ddl_text.insert("1.0", ddl)
 
     # ── Konfiguration ────────────────────────────────────────────────────
     def _all_profiles(self) -> dict:
