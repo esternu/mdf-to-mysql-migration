@@ -113,14 +113,15 @@ class App(tk.Tk):
         ttk.Checkbutton(btn_frame, text="Daten übertragen",
                         variable=self._transfer_data_var,
                         command=self._refresh_data_scope_state).pack(side="left", padx=(8, 2))
-        # "Alle" = alle Tabellen neu befüllen (TRUNCATE+INSERT)
-        # "Nur geänderte" = nur Tabellen aus Schema-Diff (neue + geänderte Spalten)
-        self._data_scope_var = tk.StringVar(value="diff")
+        # Anzeigetexte direkt als Werte verwenden (ttk.OptionMenu kennt keine Value/Label-Paare)
+        # Wert "Nur geänderte" → data_scope == "diff"
+        # Wert "Alle Tabellen"  → data_scope == "all"
+        self._data_scope_var = tk.StringVar(value="Nur geänderte")
         self._data_scope_menu = ttk.OptionMenu(
             btn_frame, self._data_scope_var,
-            "diff",
-            "diff",   "Nur geänderte",
-            "all",    "Alle Tabellen",
+            "Nur geänderte",
+            "Nur geänderte",
+            "Alle Tabellen",
         )
         self._data_scope_menu.configure(width=13)
         self._data_scope_menu.pack(side="left", padx=(0, 2))
@@ -553,7 +554,8 @@ class App(tk.Tk):
 
         dry_run     = self._dry_run_var.get()
         incremental = self._incremental_var.get()
-        data_scope  = self._data_scope_var.get()   # "all" oder "diff"
+        # "Nur geänderte" → diff-gesteuert, "Alle Tabellen" → alle migrieren
+        data_scope  = "diff" if self._data_scope_var.get() == "Nur geänderte" else "all"
 
         # Inkrementell: Schema aus MDF erforderlich
         if incremental and not hasattr(self, "_schema"):
