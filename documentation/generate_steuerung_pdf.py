@@ -386,35 +386,129 @@ def build_section3(S):
     return e
 
 
-# ── Abschnitt 4: Anwendungsfälle ─────────────────────────────────────────────
+# ── Abschnitt 4: Alle 8 Kombinationen ────────────────────────────────────────
 def build_section4(S):
     e = []
-    e += section_header('4', 'Typische Anwendungsfälle')
+    e += section_header('4', 'Alle Kombinationen — Was passiert bei jeder Auswahl')
 
-    rows = [
-        ['Szenario', 'Schema-Diff', 'Daten\nübertragen', 'Scope'],
-        ['Erstmigration\n(leere MySQL-DB)',
-         'Vollständig neu\n(Checkbox aus)', 'Ja', 'Alle\nTabellen'],
-        ['Schema erweitern\n(neue Spalte)',
-         'Inkrementell\n(Checkbox an)', 'Ja', 'Nur\ngeänderte'],
-        ['Schema prüfen\n(Was würde sich ändern?)',
-         'Inkrementell\n+ Dry-Run', 'Nein', '—'],
-        ['Nur Daten synchronisieren\n(Schema bereits aktuell)',
-         'Inkrementell\n(kein Deploy)', 'Ja', 'Nur\ngeänderte'],
-        ['Vollständiger Reset\n(Daten + Struktur)',
-         'Vollständig neu\n(Checkbox aus)', 'Ja', 'Alle\nTabellen'],
+    e.append(Paragraph(
+        'Die drei Steuerelemente ergeben 8 Kombinationen. '
+        'Scope (Nur geänderte / Alle Tabellen) ist nur relevant wenn '
+        '<b>Daten übertragen</b> aktiviert ist.',
+        S['body']
+    ))
+    e.append(sp(3))
+
+    # Hinweis-Box: Scope bei inaktivem Daten-übertragen
+    e += info_box(
+        'Ist "Daten übertragen" deaktiviert, hat die Scope-Auswahl '
+        'keine Wirkung — es werden keine Daten angefasst.',
+        S
+    )
+    e.append(sp(3))
+
+    # Tabelle: alle 8 Kombinationen
+    # Spalten: #, Schema-Diff, Daten, Scope, Was passiert
+    header_s = PS('th8', fontName='Helvetica-Bold', fontSize=8.5,
+                  textColor=WHITE, leading=12)
+    cell_s   = PS('td8', fontName='Helvetica', fontSize=8.5,
+                  textColor=GREY_DARK, leading=12)
+    tick_g   = PS('tg', fontName='Helvetica-Bold', fontSize=8.5,
+                  textColor=GREEN_MID, leading=12)
+    tick_r   = PS('tr', fontName='Helvetica-Bold', fontSize=8.5,
+                  textColor=RED_MID, leading=12)
+    grey_s   = PS('gs', fontName='Helvetica-Oblique', fontSize=8,
+                  textColor=GREY_MID, leading=12)
+
+    def C(t, st=None): return Paragraph(t, st or cell_s)
+    def H(t): return Paragraph(t, header_s)
+
+    COL_W = [6*mm, 18*mm, 16*mm, 22*mm, (W - 40*mm) - 62*mm]
+
+    rows_data = [
+        # Header
+        [H('#'), H('Schema-\nDiff'), H('Daten\nübertragen'), H('Scope'),
+         H('Was passiert')],
+
+        # ── Schema-Diff AUS ───────────────────────────────────────────────
+        [C('1'), C('Aus'), C('Nein'), C('—', grey_s),
+         C('DDL aus Tab "3 · DDL-Vorschau" wird deployt (DROP + CREATE).\n'
+           'Daten werden nicht angefasst. Bereits migrierte Daten bleiben erhalten.')],
+        [C('2'), C('Aus'), C('Nein'), C('—', grey_s),
+         C('Identisch mit #1 — Scope hat keine Wirkung.')],
+        [C('3'), C('Aus'), C('Ja'),  C('Alle\nTabellen'),
+         C('DROP + CREATE aller Tabellen (alle Daten gelöscht).\n'
+           'Danach TRUNCATE + INSERT für alle Tabellen aus der MDF.\n'
+           'Typisch: Erstmigration oder vollständiger Reset.')],
+        [C('4'), C('Aus'), C('Ja'),  C('Nur\ngeänderte'),
+         C('DROP + CREATE aller Tabellen (alle Daten gelöscht).\n'
+           'Da kein Schema-Diff vorhanden, wird der Scope ignoriert:\n'
+           'TRUNCATE + INSERT für alle Tabellen (Fallback auf "Alle").')],
+
+        # ── Schema-Diff AN ────────────────────────────────────────────────
+        [C('5'), C('An'), C('Nein'), C('—', grey_s),
+         C('Diff berechnen: ALTER TABLE / CREATE TABLE IF NOT EXISTS.\n'
+           'Nur Schemaänderungen anwenden — Daten bleiben vollständig erhalten.')],
+        [C('6'), C('An'), C('Nein'), C('—', grey_s),
+         C('Identisch mit #5 — Scope hat keine Wirkung.')],
+        [C('7'), C('An'), C('Ja'),  C('Nur\ngeänderte'),
+         C('Schema: ALTER TABLE / CREATE TABLE für geänderte Tabellen.\n'
+           'Daten: TRUNCATE + INSERT nur für Tabellen aus dem Diff\n'
+           '(neue Tabellen + Tabellen mit neuen Spalten oder Typ-Änderungen).\n'
+           'Unveränderte Tabellen: vollständig unangetastet.')],
+        [C('8'), C('An'), C('Ja'),  C('Alle\nTabellen'),
+         C('Schema: ALTER TABLE / CREATE TABLE für geänderte Tabellen.\n'
+           'Daten: TRUNCATE + INSERT für alle Tabellen aus der MDF.\n'
+           'Schema bleibt inkrementell, Daten werden vollständig neu geladen.')],
     ]
-    col_w = [5.5*cm, 4.5*cm, 2.5*cm, (W-40*mm) - 12.5*cm]
-    tbl = data_table(rows, col_w)
-    # Zeilen grün/rot je nach Szenario
+
+    tbl = Table(rows_data, colWidths=COL_W, repeatRows=1)
     tbl.setStyle(TableStyle([
-        ('BACKGROUND', (0,1), (-1,1), colors.HexColor('#FFF3F3')),
-        ('BACKGROUND', (0,2), (-1,2), colors.HexColor('#F3FFF3')),
-        ('BACKGROUND', (0,3), (-1,3), colors.HexColor('#F3FFF3')),
-        ('BACKGROUND', (0,4), (-1,4), colors.HexColor('#F3FFF3')),
-        ('BACKGROUND', (0,5), (-1,5), colors.HexColor('#FFF3F3')),
+        # Header
+        ('BACKGROUND',    (0,0), (-1,0),  DARK_BLUE),
+        ('LINEBELOW',     (0,0), (-1,0),  1.5, GOLD),
+        # Alternating rows
+        ('ROWBACKGROUNDS',(0,1), (-1,-1), [WHITE, LIGHT_BLUE]),
+        # "Aus"-Zeilen: leicht rot
+        ('BACKGROUND',    (0,1), (-1,4),  colors.HexColor('#FFF5F5')),
+        # "An"-Zeilen: leicht grün
+        ('BACKGROUND',    (0,5), (-1,8),  colors.HexColor('#F5FFF5')),
+        # Kombinationen 5+6 (Scope irrelevant): etwas heller
+        ('BACKGROUND',    (0,6), (-1,7),  colors.HexColor('#EDFAED')),
+        # Grid
+        ('GRID',          (0,0), (-1,-1), 0.4, colors.HexColor('#B0BEC5')),
+        # Padding
+        ('VALIGN',        (0,0), (-1,-1), 'TOP'),
+        ('TOPPADDING',    (0,0), (-1,-1), 5),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+        ('LEFTPADDING',   (0,0), (-1,-1), 6),
+        ('RIGHTPADDING',  (0,0), (-1,-1), 6),
+        # Trennlinie Schema-Diff AUS / AN
+        ('LINEABOVE',     (0,5), (-1,5),  1.5, GOLD),
     ]))
     e.append(tbl)
+    e.append(sp(3))
+
+    # Legende
+    legend_data = [
+        [Paragraph('<b>Legende:</b>', cell_s),
+         Paragraph('Schema-Diff Aus = Checkbox deaktiviert, '
+                   'DDL-Tab muss manuell befüllt sein (DROP + CREATE)', cell_s)],
+        [Paragraph('', cell_s),
+         Paragraph('Schema-Diff An = Checkbox aktiviert, '
+                   'Diff wird automatisch berechnet (ALTER TABLE)', cell_s)],
+        [Paragraph('', cell_s),
+         Paragraph('Scope wird nur ausgewertet wenn "Daten übertragen" aktiv ist', grey_s)],
+    ]
+    leg = Table(legend_data, colWidths=[18*mm, (W-40*mm) - 18*mm])
+    leg.setStyle(TableStyle([
+        ('BACKGROUND',    (0,0), (-1,-1), colors.HexColor('#F8F8F8')),
+        ('TOPPADDING',    (0,0), (-1,-1), 3),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+        ('LEFTPADDING',   (0,0), (-1,-1), 6),
+        ('BOX',           (0,0), (-1,-1), 0.5, GREY_MID),
+    ]))
+    e.append(leg)
     e.append(sp(4))
     return e
 
