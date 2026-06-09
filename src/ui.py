@@ -95,8 +95,7 @@ class App(tk.Tk):
         # DDL generieren
         self._led_ddl = self._make_led(btn_frame)
         self._led_ddl.pack(side="left", padx=(4, 2), pady=4)
-        ttk.Button(btn_frame, text="DDL generieren", command=self._generate_ddl).pack(side="left", padx=(0, 2))
-        ttk.Button(btn_frame, text="DDL speichern …", command=self._save_ddl).pack(side="left", padx=(0, 8))
+        ttk.Button(btn_frame, text="DDL generieren", command=self._generate_ddl).pack(side="left", padx=(0, 8))
 
         # Deploy
         self._led_deploy = self._make_led(btn_frame)
@@ -209,6 +208,7 @@ class App(tk.Tk):
 
     def _build_dest_tab(self):
         f      = self.tab_dst
+        f.columnconfigure(1, weight=1)
         fields = [
             ("MySQL Host (Synology IP):", "mysql_host", "192.168.1.x"),
             ("Port:",                     "mysql_port", "3306"),
@@ -230,6 +230,37 @@ class App(tk.Tk):
                  "Remote-Zugriff in phpMyAdmin oder SSH erlauben.",
             foreground="#555", justify="left",
         ).grid(row=len(fields)+1, column=0, columnspan=2, padx=8, pady=8, sticky="w")
+
+        # ── DDL-Ausgabeordner ─────────────────────────────────────────────
+        sep_row = len(fields) + 2
+        ttk.Separator(f, orient="horizontal").grid(
+            row=sep_row, column=0, columnspan=3, sticky="ew", padx=8, pady=(4, 0))
+        ttk.Label(f, text="DDL-Ausgabe (optional):").grid(
+            row=sep_row + 1, column=0, sticky="w", padx=8, pady=(8, 2))
+        ttk.Label(f,
+            text="Beim 'DDL generieren' wird die SQL-Datei automatisch gespeichert:\n"
+                 "• immer in temp/ (lokaler Cache)\n"
+                 "• zusätzlich im unten angegebenen Ordner mit dem angegebenen Dateinamen",
+            foreground="#555", justify="left",
+        ).grid(row=sep_row + 2, column=0, columnspan=3, padx=8, sticky="w")
+
+        # Ordner-Zeile
+        ttk.Label(f, text="Ordner:").grid(
+            row=sep_row + 3, column=0, sticky="w", padx=8, pady=(6, 2))
+        self.ddl_output_dir = tk.StringVar(value="")
+        ttk.Entry(f, textvariable=self.ddl_output_dir).grid(
+            row=sep_row + 3, column=1, sticky="ew", padx=(0, 4), pady=(6, 2))
+        ttk.Button(f, text="Durchsuchen …", command=self._browse_ddl_output_dir).grid(
+            row=sep_row + 3, column=2, padx=(0, 8), pady=(6, 2))
+
+        # Dateiname-Zeile
+        ttk.Label(f, text="Dateiname (.sql):").grid(
+            row=sep_row + 4, column=0, sticky="w", padx=8, pady=(2, 8))
+        self.ddl_output_filename = tk.StringVar(value="")
+        ttk.Entry(f, textvariable=self.ddl_output_filename, width=40).grid(
+            row=sep_row + 4, column=1, sticky="w", padx=(0, 4), pady=(2, 8))
+        ttk.Label(f, text="(leer = schema_<db>.sql)", foreground="#888").grid(
+            row=sep_row + 4, column=2, sticky="w", padx=(0, 8), pady=(2, 8))
 
     def _build_ddl_tab(self):
         f = self.tab_ddl
@@ -484,6 +515,15 @@ class App(tk.Tk):
 
         threading.Thread(target=task, daemon=True).start()
 
+    def _browse_ddl_output_dir(self):
+        """Ordner-Dialog für den DDL-Ausgabeordner."""
+        chosen = filedialog.askdirectory(
+            title="DDL-Ausgabeordner wählen",
+            initialdir=self.ddl_output_dir.get() or os.path.expanduser("~"),
+        )
+        if chosen:
+            self.ddl_output_dir.set(chosen)
+
     def _generate_ddl(self):
         if not hasattr(self, "_schema"):
             messagebox.showinfo("Hinweis", "Bitte zuerst 'Schema lesen' ausführen.")
@@ -491,36 +531,49 @@ class App(tk.Tk):
         self._set_led(self._led_ddl, "running")
         self._progress_start_determinate("DDL generieren …")
         try:
-            target_db = self.mysql_db.get().strip() or "migrated_db"
+            target_db   = self.mysql_db.get().strip() or "migrated_db"
+            output_dir  = self.ddl_output_dir.get().strip()
+            custom_name = self.ddl_output_filename.get().strip()
             self.log(f"Generiere DDL für Zieldatenbank '{target_db}' …")
+
+            # Schritt 1: DDL erzeugen (33 %)
             ddl = generate_mysql_ddl(self._schema, target_db)
             self.ddl_text.delete("1.0", "end")
             self.ddl_text.insert("1.0", ddl)
-            tcount = len(self._schema["tables"])
-            vcount = len(self._schema["views"])
-            self.log(f"DDL generiert: {tcount} Tabellen, {vcount} Views. Prüfe Tab '3 · DDL-Vorschau'.")
+            tcount   = len(self._schema["tables"])
+            vcount   = len(self._schema["views"])
+            # Dateiname: benutzerdefiniert, fehlende .sql-Endung ergänzen, Fallback schema_<db>.sql
+            if custom_name:
+                filename = custom_name if custom_name.lower().endswith(".sql") else custom_name + ".sql"
+            else:
+                filename = f"schema_{target_db}.sql"
+            self._progress_var.set(33.0)
+
+            # Schritt 2: In temp/ speichern (66 %)
+            self._progress_label.config(text="Speichere DDL in temp/ …")
+            os.makedirs(TEMP_DIR, exist_ok=True)
+            temp_path = os.path.join(TEMP_DIR, filename)
+            with open(temp_path, "w", encoding="utf-8") as fh:
+                fh.write(ddl)
+            self.log(f"DDL → temp: {temp_path}")
+            self._progress_var.set(66.0)
+
+            # Schritt 3: In Ausgabeordner speichern (optional, 100 %)
+            if output_dir:
+                self._progress_label.config(text="Speichere DDL in Ausgabeordner …")
+                os.makedirs(output_dir, exist_ok=True)
+                out_path = os.path.join(output_dir, filename)
+                with open(out_path, "w", encoding="utf-8") as fh:
+                    fh.write(ddl)
+                self.log(f"DDL → Ausgabeordner: {out_path}")
+
+            self.log(f"DDL generiert: {tcount} Tabellen, {vcount} Views.")
             self._set_led(self._led_ddl, "ok")
             self._progress_finish(f"DDL: {tcount} Tabellen, {vcount} Views ✓", True, 3000)
         except Exception as e:
             self.log(f"FEHLER DDL: {e}")
             self._set_led(self._led_ddl, "error")
             self._progress_finish(f"Fehler: {e}", False, 0)
-
-    def _save_ddl(self):
-        ddl = self.ddl_text.get("1.0", "end").strip()
-        if not ddl:
-            messagebox.showinfo("Hinweis", "DDL-Vorschau ist leer.")
-            return
-        path = filedialog.asksaveasfilename(
-            title="DDL speichern",
-            defaultextension=".sql",
-            initialdir=TEMP_DIR,
-            filetypes=[("SQL-Datei", "*.sql"), ("Alle Dateien", "*.*")],
-        )
-        if path:
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(ddl)
-            self.log(f"DDL gespeichert: {path}")
 
     def _test_mysql(self):
         if not MYSQL_OK:
@@ -833,16 +886,18 @@ class App(tk.Tk):
         profile = self._profile_var.get().strip() or "Standard"
         pw_obf  = base64.b64encode(self.mysql_pass.get().encode()).decode()
         data    = {
-            "mdf_path":       self.mdf_path.get(),
-            "db_attach_name": self.db_attach_name.get(),
-            "driver":         self.driver_var.get(),
-            "mysql_host":     self.mysql_host.get(),
-            "mysql_port":     self.mysql_port.get(),
-            "mysql_user":     self.mysql_user.get(),
-            "mysql_pass_b64": pw_obf,
-            "mysql_db":       self.mysql_db.get(),
-            "transfer_data":  self._transfer_data_var.get(),
-            "saved_at":       datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "mdf_path":        self.mdf_path.get(),
+            "db_attach_name":  self.db_attach_name.get(),
+            "driver":          self.driver_var.get(),
+            "mysql_host":      self.mysql_host.get(),
+            "mysql_port":      self.mysql_port.get(),
+            "mysql_user":      self.mysql_user.get(),
+            "mysql_pass_b64":  pw_obf,
+            "mysql_db":        self.mysql_db.get(),
+            "transfer_data":   self._transfer_data_var.get(),
+            "ddl_output_dir":      self.ddl_output_dir.get(),
+            "ddl_output_filename": self.ddl_output_filename.get(),
+            "saved_at":        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         all_cfg          = self._all_profiles()
         all_cfg[profile] = data
@@ -879,6 +934,8 @@ class App(tk.Tk):
             pw = ""
         self.mysql_pass.set(pw)
         self._transfer_data_var.set(d.get("transfer_data", False))
+        self.ddl_output_dir.set(d.get("ddl_output_dir", ""))
+        self.ddl_output_filename.set(d.get("ddl_output_filename", ""))
         saved_driver = d.get("driver", "")
         if saved_driver:
             self.driver_var.set(saved_driver)
