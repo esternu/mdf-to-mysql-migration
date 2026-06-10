@@ -22,7 +22,7 @@ TYPE_MAP: Dict[str, str] = {
     "int":             "INT",
     "bigint":          "BIGINT",
     "smallint":        "SMALLINT",
-    "tinyint":         "TINYINT",
+    "tinyint":         "TINYINT UNSIGNED",
     "bit":             "TINYINT(1)",
     "decimal":         "DECIMAL",
     "numeric":         "DECIMAL",

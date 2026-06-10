@@ -56,6 +56,11 @@ class TestConvertType:
     def test_bit(self):
         assert convert_type("bit", None, None, None) == "TINYINT(1)"
 
+    def test_tinyint_unsigned(self):
+        # SQL Server TINYINT ist 0-255 (unsigned), MySQL TINYINT ist
+        # standardmaessig signed -> UNSIGNED noetig fuer korrekten Wertebereich
+        assert convert_type("tinyint", None, None, None) == "TINYINT UNSIGNED"
+
     def test_decimal_with_scale(self):
         assert convert_type("decimal", None, 10, 2) == "DECIMAL(10,2)"
 
