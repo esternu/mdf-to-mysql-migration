@@ -22,7 +22,7 @@ manuelle Ausfuehrung gedacht (P4: "nicht uebersetzbar, hand-geschrieben").
 """
 from typing import Iterable, Optional
 
-from .transform import mssql_name
+from transform import mssql_name
 
 DEFAULT_EXCLUDED_TABLES = {"tableauditlog", "row_locks", "databaseversion"}
 

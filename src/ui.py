@@ -17,6 +17,7 @@ from typing import Optional
 from paths        import CFG_FILE, LOG_FILE, TEMP_DIR, CHECKPOINT_FILE
 from mssql        import attach_mdf, detach_and_cleanup, get_mssql_drivers, PYODBC_OK
 from transform    import generate_mysql_ddl
+from audit_triggers import generate_audit_triggers
 from deploy       import deploy_to_mysql, MYSQL_OK
 from migrate_data import (get_table_list, migrate_all, CHUNK_SIZE,
                           checkpoint_exists, delete_checkpoint, load_checkpoint)
@@ -536,7 +537,7 @@ class App(tk.Tk):
             custom_name = self.ddl_output_filename.get().strip()
             self.log(f"Generiere DDL für Zieldatenbank '{target_db}' …")
 
-            # Schritt 1: DDL erzeugen (33 %)
+            # Schritt 1: DDL erzeugen (25 %)
             ddl = generate_mysql_ddl(self._schema, target_db)
             self.ddl_text.delete("1.0", "end")
             self.ddl_text.insert("1.0", ddl)
@@ -547,18 +548,28 @@ class App(tk.Tk):
                 filename = custom_name if custom_name.lower().endswith(".sql") else custom_name + ".sql"
             else:
                 filename = f"schema_{target_db}.sql"
-            self._progress_var.set(33.0)
+            self._progress_var.set(25.0)
 
-            # Schritt 2: In temp/ speichern (66 %)
+            # Schritt 2: Audit-Trigger erzeugen (50 %)
+            self._progress_label.config(text="Audit-Trigger generieren …")
+            audit_sql      = generate_audit_triggers(self._schema)
+            audit_filename = f"audit_triggers_{target_db}.sql"
+            self._progress_var.set(50.0)
+
+            # Schritt 3: In temp/ speichern (75 %)
             self._progress_label.config(text="Speichere DDL in temp/ …")
             os.makedirs(TEMP_DIR, exist_ok=True)
             temp_path = os.path.join(TEMP_DIR, filename)
             with open(temp_path, "w", encoding="utf-8") as fh:
                 fh.write(ddl)
             self.log(f"DDL → temp: {temp_path}")
-            self._progress_var.set(66.0)
+            audit_temp_path = os.path.join(TEMP_DIR, audit_filename)
+            with open(audit_temp_path, "w", encoding="utf-8") as fh:
+                fh.write(audit_sql)
+            self.log(f"Audit-Trigger → temp: {audit_temp_path}")
+            self._progress_var.set(75.0)
 
-            # Schritt 3: In Ausgabeordner speichern (optional, 100 %)
+            # Schritt 4: In Ausgabeordner speichern (optional, 100 %)
             if output_dir:
                 self._progress_label.config(text="Speichere DDL in Ausgabeordner …")
                 os.makedirs(output_dir, exist_ok=True)
@@ -566,8 +577,14 @@ class App(tk.Tk):
                 with open(out_path, "w", encoding="utf-8") as fh:
                     fh.write(ddl)
                 self.log(f"DDL → Ausgabeordner: {out_path}")
+                audit_out_path = os.path.join(output_dir, audit_filename)
+                with open(audit_out_path, "w", encoding="utf-8") as fh:
+                    fh.write(audit_sql)
+                self.log(f"Audit-Trigger → Ausgabeordner: {audit_out_path}")
 
             self.log(f"DDL generiert: {tcount} Tabellen, {vcount} Views.")
+            self.log("Hinweis: audit_triggers_*.sql enthaelt DELIMITER-Syntax "
+                      "und muss manuell per mysql-CLI ausgefuehrt werden.")
             self._set_led(self._led_ddl, "ok")
             self._progress_finish(f"DDL: {tcount} Tabellen, {vcount} Views ✓", True, 3000)
         except Exception as e:

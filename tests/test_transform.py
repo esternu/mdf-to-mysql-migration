@@ -549,3 +549,19 @@ class TestGenerateMysqlDdl:
         drop_pos   = ddl.index("DROP TABLE IF EXISTS `Users`")
         create_pos = ddl.index("CREATE TABLE `Users`")
         assert drop_pos < create_pos
+
+    def test_view_audit_changes_excluded(self):
+        # ViewAuditChanges basiert auf MSSQL-OPENJSON/FULL OUTER JOIN und wird
+        # durch die Audit-Trigger (audit_triggers.py, P4) ersetzt.
+        schema = dict(_MINIMAL_SCHEMA)
+        schema["views"] = {
+            "dbo.ViewAuditChanges": {
+                "name": "ViewAuditChanges", "schema": "dbo",
+                "definition": "CREATE VIEW [dbo].[ViewAuditChanges] AS SELECT 1 AS n",
+            },
+            "dbo.V": {"name": "V", "schema": "dbo",
+                      "definition": "CREATE VIEW [dbo].[V] AS SELECT 1 AS n"},
+        }
+        ddl = generate_mysql_ddl(schema, "TestDB")
+        assert "ViewAuditChanges" not in ddl
+        assert "CREATE VIEW `V`" in ddl
