@@ -8,6 +8,11 @@ Enthält:
 import re
 from typing import Dict, List, Optional
 
+# Views, die nicht uebersetzt werden: ViewAuditChanges basiert auf MSSQL-
+# spezifischem OPENJSON/FULL OUTER JOIN und wird durch die Audit-Trigger
+# (audit_triggers.py, P4) ersetzt -> aus dem generierten DDL ausgeschlossen.
+EXCLUDED_VIEWS = {"viewauditchanges"}
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Typ-Konvertierung
@@ -465,6 +470,8 @@ def generate_mysql_ddl(schema: dict, target_db: str) -> str:
     # ── Views (topologisch sortiert) ──────────────────────────────────────
     for vinfo in _topo_sort_views(schema["views"]):
         vname        = vinfo["name"]
+        if vname.lower() in EXCLUDED_VIEWS:
+            continue
         vdef, warns  = convert_view_sql(vinfo["definition"])
         lines.append(f"DROP VIEW IF EXISTS {mssql_name(vname)};")
         for w in warns:
