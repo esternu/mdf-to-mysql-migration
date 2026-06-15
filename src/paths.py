@@ -13,6 +13,11 @@ LOG_DIR          = os.path.join(os.path.dirname(PROJECT_DIR), "mdf-to-mysql-logs
 TEMP_DIR         = os.path.join(PROJECT_DIR, "temp")
 CHECKPOINT_FILE  = os.path.join(TEMP_DIR, "migration_checkpoint.json")
 
+# Kanonischer Schema-Ordner des WCEP-Projekts (Sibling-Repo). Audit-Trigger
+# für die Cockpit_Datenbank werden hier zusätzlich gespiegelt, siehe
+# WCEP/Tools/schema/README.md.
+WCEP_SCHEMA_DIR  = os.path.join(os.path.dirname(PROJECT_DIR), "WCEP", "Tools", "schema")
+
 os.makedirs(LOG_DIR,  exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
 

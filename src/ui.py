@@ -14,7 +14,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Optional
 
 # Interne Module
-from paths        import CFG_FILE, LOG_FILE, TEMP_DIR, CHECKPOINT_FILE
+from paths        import CFG_FILE, LOG_FILE, TEMP_DIR, CHECKPOINT_FILE, WCEP_SCHEMA_DIR
 from mssql        import attach_mdf, detach_and_cleanup, get_mssql_drivers, PYODBC_OK
 from transform    import generate_mysql_ddl
 from audit_triggers import generate_audit_triggers
@@ -581,6 +581,13 @@ class App(tk.Tk):
                 with open(audit_out_path, "w", encoding="utf-8") as fh:
                     fh.write(audit_sql)
                 self.log(f"Audit-Trigger → Ausgabeordner: {audit_out_path}")
+            elif target_db == "Cockpit_Datenbank" and os.path.isdir(WCEP_SCHEMA_DIR):
+                # Kein Ausgabeordner gewählt: Audit-Trigger zusätzlich in den
+                # kanonischen WCEP-Schema-Ordner spiegeln.
+                audit_wcep_path = os.path.join(WCEP_SCHEMA_DIR, audit_filename)
+                with open(audit_wcep_path, "w", encoding="utf-8") as fh:
+                    fh.write(audit_sql)
+                self.log(f"Audit-Trigger → WCEP Schema: {audit_wcep_path}")
 
             self.log(f"DDL generiert: {tcount} Tabellen, {vcount} Views.")
             self.log("Hinweis: audit_triggers_*.sql enthaelt DELIMITER-Syntax "
