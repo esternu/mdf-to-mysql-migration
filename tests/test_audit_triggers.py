@@ -42,6 +42,54 @@ _SCHEMA = {
             "pk": ["Id"],
             "fk": [],
         },
+        "dbo.TableCost": {
+            "schema": "dbo", "name": "TableCost",
+            "columns": [
+                {"name": "Id", "pos": 1, "nullable": False, "type": "int",
+                 "max_len": None, "precision": None, "scale": None,
+                 "default": None, "identity": True},
+                {"name": "Metal per gramm", "pos": 2, "nullable": True, "type": "decimal",
+                 "max_len": None, "precision": 18, "scale": 4,
+                 "default": None, "identity": False},
+                {"name": "Editor", "pos": 3, "nullable": True, "type": "nvarchar",
+                 "max_len": 50, "precision": None, "scale": None,
+                 "default": None, "identity": False},
+            ],
+            "pk": ["Id"],
+            "fk": [],
+        },
+        "dbo.TableJig": {
+            "schema": "dbo", "name": "TableJig",
+            "columns": [
+                {"name": "Id",      "pos": 1, "nullable": False, "type": "int",
+                 "max_len": None, "precision": None, "scale": None,
+                 "default": None, "identity": True},
+                {"name": "Name",    "pos": 2, "nullable": True, "type": "nvarchar",
+                 "max_len": 100, "precision": None, "scale": None,
+                 "default": None, "identity": False},
+                {"name": "Picture", "pos": 3, "nullable": True, "type": "varbinary",
+                 "max_len": -1, "precision": None, "scale": None,
+                 "default": None, "identity": False},
+            ],
+            "pk": ["Id"],
+            "fk": [],
+        },
+        "dbo.TableProduct": {
+            "schema": "dbo", "name": "TableProduct",
+            "columns": [
+                {"name": "ArticleId", "pos": 1, "nullable": False, "type": "int",
+                 "max_len": None, "precision": None, "scale": None,
+                 "default": None, "identity": False},
+                {"name": "Layer",     "pos": 2, "nullable": False, "type": "int",
+                 "max_len": None, "precision": None, "scale": None,
+                 "default": None, "identity": False},
+                {"name": "Value",     "pos": 3, "nullable": True, "type": "int",
+                 "max_len": None, "precision": None, "scale": None,
+                 "default": None, "identity": False},
+            ],
+            "pk": ["ArticleId", "Layer"],
+            "fk": [],
+        },
     },
     "views": {},
 }
@@ -50,9 +98,15 @@ _SCHEMA = {
 class TestGenerateAuditTriggers:
     def test_audit_log_table_created(self):
         sql = generate_audit_triggers(_SCHEMA)
-        assert "CREATE TABLE `TableAuditLog`" in sql
+        assert "CREATE TABLE IF NOT EXISTS `TableAuditLog`" in sql
         assert "`OldValue`  JSON NULL" in sql
         assert "`NewValue`  JSON NULL" in sql
+
+    def test_audit_log_table_not_dropped(self):
+        # P3: Historie darf bei Re-Run nicht geloescht werden.
+        sql = generate_audit_triggers(_SCHEMA)
+        assert "DROP TABLE" not in sql
+        assert "CREATE INDEX IF NOT EXISTS" in sql
 
     def test_delimiter_wrapping(self):
         sql = generate_audit_triggers(_SCHEMA)
@@ -87,15 +141,15 @@ class TestGenerateAuditTriggers:
         sql = generate_audit_triggers(_SCHEMA)
         assert "CREATE TRIGGER `trg_Bath_Audit_Update`" in sql
         assert "IF NOT (OLD.`Name` <=> NEW.`Name`) THEN" in sql
-        assert "JSON_SET(@audit_old, '$.Name', OLD.`Name`)" in sql
-        assert "@audit_changed = 1" in sql
-        assert "IF @audit_changed = 1 THEN" in sql
+        assert "JSON_SET(v_old, '$.\"Name\"', OLD.`Name`)" in sql
+        assert "SET v_changed = 1;" in sql
+        assert "IF v_changed = 1 THEN" in sql
 
     def test_update_trigger_includes_pk_for_row_identification(self):
         sql = generate_audit_triggers(_SCHEMA)
         # PK-Spalte wird initial gesetzt, aber nicht in der Diff-Schleife verglichen
-        assert "SET @audit_old = JSON_OBJECT('Id', OLD.`Id`);" in sql
-        assert "SET @audit_new = JSON_OBJECT('Id', NEW.`Id`);" in sql
+        assert "DECLARE v_old JSON DEFAULT JSON_OBJECT('Id', OLD.`Id`);" in sql
+        assert "DECLARE v_new JSON DEFAULT JSON_OBJECT('Id', NEW.`Id`);" in sql
         assert "IF NOT (OLD.`Id` <=> NEW.`Id`) THEN" not in sql
 
     def test_no_editor_column_uses_null(self):
@@ -105,3 +159,45 @@ class TestGenerateAuditTriggers:
         end   = sql.index("END$$", start)
         section = sql[start:end]
         assert "VALUES ('NoEditor', 'INSERT', NULL," in section
+
+    def test_json_path_quoting_for_special_chars(self):
+        # P1: Spaltennamen mit Leerzeichen muessen im JSON-Pfad gequotet
+        # werden, sonst "Invalid JSON path expression" beim UPDATE.
+        sql = generate_audit_triggers(_SCHEMA)
+        start = sql.index("CREATE TRIGGER `trg_TableCost_Audit_Update`")
+        end   = sql.index("END$$", start)
+        section = sql[start:end]
+        assert "JSON_SET(v_old, '$.\"Metal per gramm\"', OLD.`Metal per gramm`)" in section
+        assert "JSON_SET(v_new, '$.\"Metal per gramm\"', NEW.`Metal per gramm`)" in section
+        assert "'$.Metal per gramm'" not in section
+
+    def test_binary_columns_excluded_from_audit_json(self):
+        # P2: BLOB/varbinary-Spalten (z.B. Picture) gehoeren nicht ins
+        # Audit-JSON - weder bei INSERT/DELETE noch im UPDATE-Diff.
+        sql = generate_audit_triggers(_SCHEMA)
+
+        start = sql.index("CREATE TRIGGER `trg_TableJig_Audit_Insert`")
+        end   = sql.index("END$$", start)
+        insert_section = sql[start:end]
+        assert "Picture" not in insert_section
+
+        start = sql.index("CREATE TRIGGER `trg_TableJig_Audit_Delete`")
+        end   = sql.index("END$$", start)
+        delete_section = sql[start:end]
+        assert "Picture" not in delete_section
+
+        start = sql.index("CREATE TRIGGER `trg_TableJig_Audit_Update`")
+        end   = sql.index("END$$", start)
+        update_section = sql[start:end]
+        assert "Picture" not in update_section
+
+    def test_composite_pk_change_is_logged(self):
+        # P5: Aenderung einer Nicht-Identity-PK-Spalte (composite Key) soll
+        # ebenfalls v_changed = 1 setzen, auch wenn sonst nichts geaendert
+        # wurde.
+        sql = generate_audit_triggers(_SCHEMA)
+        start = sql.index("CREATE TRIGGER `trg_TableProduct_Audit_Update`")
+        end   = sql.index("END$$", start)
+        section = sql[start:end]
+        assert "IF NOT (OLD.`ArticleId` <=> NEW.`ArticleId`) THEN" in section
+        assert "IF NOT (OLD.`Layer` <=> NEW.`Layer`) THEN" in section
