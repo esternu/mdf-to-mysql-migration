@@ -86,8 +86,7 @@ auditiert werden sollen: PK-Spalten ebenfalls per `<=>` vergleichen und ggf.
 - Pro Tabelle `AFTER INSERT/UPDATE/DELETE`, JSON-Payload.
 - UPDATE = nur geänderte Felder (Delta) + PK als Kontext; Skip bei No-op-Update.
 - `DROP TRIGGER IF EXISTS` je Trigger → re-runnable.
-- `TableAuditLog`, `row_locks`, `TableDateTimeCreator` werden korrekt nicht
-  auditiert.
+- `TableAuditLog`, `row_locks` werden korrekt nicht auditiert.
 - `ChangedBy = NEW/OLD.Editor` passt zur App (setzt `Editor` aus `X-User-Name`).
 
 ## Test-Empfehlung
