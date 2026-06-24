@@ -98,7 +98,9 @@ def deploy_to_mysql(
     Jede durch ';' getrennte Anweisung wird einzeln ausgeführt.
     Semikolons in -- Kommentaren und String-Literalen werden ignoriert.
     Fehler werden gesammelt und am Ende als Block geloggt, damit
-    der Rest des Scripts trotzdem durchläuft.
+    der Rest des Scripts trotzdem durchläuft. Gab es mindestens einen
+    Fehler, wird am Ende ein RuntimeError geworfen, damit der Aufrufer
+    keinen Erfolg meldet, obwohl Anweisungen fehlgeschlagen sind.
 
     progress_callback(done, total) wird nach jeder ausgeführten Anweisung aufgerufen.
     """
@@ -108,6 +110,7 @@ def deploy_to_mysql(
         port=port,
         user=user,
         password=password,
+        database=target_db,
         allow_local_infile=True,
         charset="utf8mb4",
         connection_timeout=10,
@@ -135,5 +138,6 @@ def deploy_to_mysql(
         log(f"\n⚠ {len(errors)} Fehler aufgetreten:")
         for err in errors:
             log("  " + err)
+        raise RuntimeError(f"{len(errors)} von {total} SQL-Anweisungen fehlgeschlagen")
     else:
         log(f"\n✓ Alle {total} Anweisungen erfolgreich ausgeführt.")

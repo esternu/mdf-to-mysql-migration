@@ -141,20 +141,31 @@ class TestConnectionParameters:
         deploy_to_mysql("SELECT 1;", "h", 3306, "u", "p", "db", _noop)
         assert mock_connect.call_args[1]["charset"] == "utf8mb4"
 
+    def test_target_db_selected_on_connect(self, mocker):
+        # Ohne database= schlagen ALTER/CREATE TABLE mit "No database
+        # selected" fehl, sobald Tabellennamen nicht voll qualifiziert sind.
+        mock_connect = mocker.patch(
+            "mysql.connector.connect",
+            return_value=_MockConn(_MockCursor()),
+        )
+        deploy_to_mysql("SELECT 1;", "h", 3306, "u", "p", "Cockpit_Datenbank", _noop)
+        assert mock_connect.call_args[1]["database"] == "Cockpit_Datenbank"
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Fehlerbehandlung
 # ════════════════════════════════════════════════════════════════════════════
 class TestErrorHandling:
-    def test_error_logged_not_raised(self, mocker):
+    def test_error_logged_then_raised(self, mocker):
         err = mysql.connector.Error("Syntax error")
         cur  = _MockCursor(side_effects=[err])
         conn = _MockConn(cur)
         mocker.patch("mysql.connector.connect", return_value=conn)
 
         log_lines: list = []
-        # sollte keine Exception werfen
-        deploy_to_mysql("BAD SQL;", "h", 3306, "u", "p", "db", log_lines.append)
+        # Fehler werden vor dem Raise geloggt, damit der Aufrufer Details sieht
+        with pytest.raises(RuntimeError):
+            deploy_to_mysql("BAD SQL;", "h", 3306, "u", "p", "db", log_lines.append)
         assert any("⚠" in l or "Fehler" in l for l in log_lines)
 
     def test_partial_failure_continues_execution(self, mocker):
@@ -164,7 +175,8 @@ class TestErrorHandling:
         conn = _MockConn(cur)
         mocker.patch("mysql.connector.connect", return_value=conn)
 
-        deploy_to_mysql("S1;S2;S3;", "h", 3306, "u", "p", "db", _noop)
+        with pytest.raises(RuntimeError):
+            deploy_to_mysql("S1;S2;S3;", "h", 3306, "u", "p", "db", _noop)
         assert len(cur.calls) == 3   # alle drei versucht
 
     def test_error_count_in_log(self, mocker):
@@ -174,7 +186,8 @@ class TestErrorHandling:
         mocker.patch("mysql.connector.connect", return_value=conn)
 
         log_lines: list = []
-        deploy_to_mysql("S1;S2;", "h", 3306, "u", "p", "db", log_lines.append)
+        with pytest.raises(RuntimeError):
+            deploy_to_mysql("S1;S2;", "h", 3306, "u", "p", "db", log_lines.append)
         # Log-Zusammenfassung soll "2" erwähnen
         combined = " ".join(log_lines)
         assert "2" in combined
@@ -185,8 +198,25 @@ class TestErrorHandling:
         conn = _MockConn(cur)
         mocker.patch("mysql.connector.connect", return_value=conn)
 
-        deploy_to_mysql("BAD;", "h", 3306, "u", "p", "db", _noop)
+        with pytest.raises(RuntimeError):
+            deploy_to_mysql("BAD;", "h", 3306, "u", "p", "db", _noop)
         assert conn.closed is True
+
+    def test_raises_runtime_error_with_failure_count(self, mocker):
+        effects = [None, mysql.connector.Error("fail")]
+        cur  = _MockCursor(side_effects=effects)
+        conn = _MockConn(cur)
+        mocker.patch("mysql.connector.connect", return_value=conn)
+
+        with pytest.raises(RuntimeError, match="1 von 2"):
+            deploy_to_mysql("S1;S2;", "h", 3306, "u", "p", "db", _noop)
+
+    def test_no_raise_when_all_succeed(self, mocker):
+        cur  = _MockCursor()
+        conn = _MockConn(cur)
+        mocker.patch("mysql.connector.connect", return_value=conn)
+
+        deploy_to_mysql("S1;S2;", "h", 3306, "u", "p", "db", _noop)  # no raise
 
 
 # ════════════════════════════════════════════════════════════════════════════
