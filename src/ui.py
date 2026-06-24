@@ -772,8 +772,9 @@ class App(tk.Tk):
                                         f"'{new_name}' ist neu (beide Typ {mtype}).\n\n"
                                         f"Handelt es sich um eine Umbenennung?\n"
                                         f"Falls ja, werden die bestehenden Werte automatisch "
-                                        f"übernommen:\n"
-                                        f"UPDATE `{rtbl}` SET `{new_name}` = `{old_name}`;",
+                                        f"übernommen und die alte Spalte gelöscht:\n"
+                                        f"UPDATE `{rtbl}` SET `{new_name}` = `{old_name}`;\n"
+                                        f"ALTER TABLE `{rtbl}` DROP COLUMN `{old_name}`;",
                                     ):
                                         confirmed_renames.setdefault(rtbl, []).append(
                                             (old_name, new_name)

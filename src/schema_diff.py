@@ -453,7 +453,7 @@ def generate_diff_ddl(
                 f"{mysql_type}{null_str}{auto_str}{def_str};"
             )
 
-        # Umbenennungen (User-bestätigt): bestehende Werte übernehmen
+        # Umbenennungen (User-bestätigt): Werte übernehmen, alte Spalte löschen
         for old_name, new_name in rename_pairs.get(tbl_name, []):
             lines.append(
                 f"-- Umbenennung übernommen: {tbl_name}.{old_name} → {new_name}"
@@ -461,6 +461,10 @@ def generate_diff_ddl(
             lines.append(
                 f"UPDATE {mssql_name(tbl_name)} "
                 f"SET {mssql_name(new_name)} = {mssql_name(old_name)};"
+            )
+            lines.append(
+                f"ALTER TABLE {mssql_name(tbl_name)} "
+                f"DROP COLUMN {mssql_name(old_name)};"
             )
 
         # Geänderte Spaltentypen
@@ -499,13 +503,29 @@ def generate_diff_ddl(
     lines.append("")
     lines.append("SET FOREIGN_KEY_CHECKS = 1;")
 
-    # Warnung für entfernte Elemente am Ende
-    if diff["removed_tables"] or diff["removed_columns"]:
+    # Warnung für entfernte Elemente am Ende (umbenannte Spalten ausgenommen,
+    # die wurden oben bereits per DROP COLUMN entfernt)
+    renamed_old_cols = {
+        (tbl.lower(), old_name.lower())
+        for tbl, pairs in rename_pairs.items()
+        for old_name, _ in pairs
+    }
+    remaining_removed_columns = {
+        t: [
+            c for c in cols
+            if (t.lower(), (c if isinstance(c, str) else c.get("name", str(c))).lower())
+            not in renamed_old_cols
+        ]
+        for t, cols in diff["removed_columns"].items()
+    }
+    remaining_removed_columns = {t: cols for t, cols in remaining_removed_columns.items() if cols}
+
+    if diff["removed_tables"] or remaining_removed_columns:
         lines.append("")
         lines.append("-- ⚠ Folgende Elemente existieren in MySQL aber nicht mehr in der MDF:")
         for t in diff["removed_tables"]:
             lines.append(f"--   Tabelle: {t}")
-        for t, cols in diff["removed_columns"].items():
+        for t, cols in remaining_removed_columns.items():
             for c in cols:
                 cname = c if isinstance(c, str) else c.get("name", str(c))
                 lines.append(f"--   Spalte:  {t}.{cname}")

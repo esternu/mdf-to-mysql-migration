@@ -269,8 +269,34 @@ def test_generate_diff_ddl_emits_update_for_confirmed_rename():
     ddl, _ = generate_diff_ddl(diff, src, "testdb", rename_pairs)
     assert "ADD COLUMN `Bath Surface`" in ddl
     assert "UPDATE `TableSolution` SET `Bath Surface` = `surface`;" in ddl
-    # ADD COLUMN muss vor dem UPDATE stehen, sonst existiert die Spalte noch nicht
-    assert ddl.index("ADD COLUMN `Bath Surface`") < ddl.index("UPDATE `TableSolution`")
+    assert "DROP COLUMN `surface`;" in ddl
+    # Reihenfolge: erst Spalte anlegen, dann Werte kopieren, dann alte loeschen
+    assert (
+        ddl.index("ADD COLUMN `Bath Surface`")
+        < ddl.index("UPDATE `TableSolution`")
+        < ddl.index("DROP COLUMN `surface`")
+    )
+    # Umbenannte Spalte taucht nicht mehr in der "nicht geloescht"-Warnung auf
+    assert "Spalte:  TableSolution.surface" not in ddl
+
+
+def test_generate_diff_ddl_unrenamed_removed_column_still_warned():
+    # Eine entfernte Spalte, die NICHT als Umbenennung bestaetigt wurde,
+    # bleibt weiterhin in der Warnung am Ende.
+    src = {"tables": {"t1": _src_table("TableSolution", [
+        _src_col("Id", "int", pos=1),
+        _src_col("Bath Surface", "float", pos=2),
+    ])}}
+    tgt = {"tables": {"tablesolution": _mysql_table("tablesolution", [
+        _mysql_col("Id", "INT", pos=1),
+        _mysql_col("surface", "DOUBLE", pos=2),
+        _mysql_col("Unrelated", "DOUBLE", pos=3),
+    ])}}
+    diff = diff_schemas(src, tgt)
+    rename_pairs = {"TableSolution": [("surface", "Bath Surface")]}
+    ddl, _ = generate_diff_ddl(diff, src, "testdb", rename_pairs)
+    assert "DROP COLUMN `surface`;" in ddl
+    assert "Spalte:  TableSolution.Unrelated" in ddl
 
 
 def test_generate_diff_ddl_without_rename_pairs_unchanged():
