@@ -7,7 +7,7 @@ Tests für src/schema_diff.py:
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from schema_diff import diff_schemas, generate_diff_ddl, format_diff_summary
+from schema_diff import diff_schemas, generate_diff_ddl, format_diff_summary, detect_rename_candidates
 
 
 # ── Hilfsfunktionen ───────────────────────────────────────────────────────────
@@ -23,26 +23,27 @@ def _src_table(name, columns, pk=None, fk=None, indexes=None):
     }
 
 def _src_col(name, sql_type="int", nullable=True, max_len=None, precision=None,
-             scale=None, identity=False, default=None):
+             scale=None, identity=False, default=None, pos=None):
     return {
         "name": name, "type": sql_type, "nullable": nullable,
         "max_len": max_len, "precision": precision, "scale": scale,
-        "identity": identity, "default": default,
+        "identity": identity, "default": default, "pos": pos,
     }
 
 def _mysql_table(name, columns, indexes=None, fks=None):
     """Erzeugt einen Tabelleneintrag im MySQL-Schema-Format (wie read_mysql_schema() liefert)."""
     return {
         "columns": {c["name"]: {"type": c["type"], "nullable": c["nullable"],
-                                "default": None, "auto_increment": False}
+                                "default": None, "auto_increment": False,
+                                "pos": c.get("pos")}
                     for c in columns},
         "pk":      [],
         "indexes": indexes or {},
         "fks":     fks or {},
     }
 
-def _mysql_col(name, mysql_type, nullable=True):
-    return {"name": name, "type": mysql_type, "nullable": nullable}
+def _mysql_col(name, mysql_type, nullable=True, pos=None):
+    return {"name": name, "type": mysql_type, "nullable": nullable, "pos": pos}
 
 
 # ── Tests: diff_schemas ───────────────────────────────────────────────────────
@@ -118,6 +119,20 @@ def test_removed_column_only_warns():
     assert any("old_col" in w for w in diff["warnings"])
 
 
+def test_removed_column_entry_includes_name():
+    # format_diff_summary() braucht "name" im removed_columns-Eintrag,
+    # sonst landet der rohe dict-repr im Log statt des Spaltennamens.
+    src = {"tables": {"t1": _src_table("MyTable", [_src_col("id", "int")])}}
+    tgt = {"tables": {"mytable": _mysql_table("mytable", [
+        _mysql_col("id", "INT"),
+        _mysql_col("old_col", "VARCHAR(50)"),
+    ])}}
+    diff = diff_schemas(src, tgt)
+    summary = format_diff_summary(diff)
+    assert "old_col" in summary
+    assert "{'type'" not in summary
+
+
 # ── Tests: generate_diff_ddl ──────────────────────────────────────────────────
 
 def test_generate_create_table():
@@ -167,6 +182,132 @@ def test_no_changes_produces_minimal_ddl():
     assert "CREATE TABLE" not in ddl
     assert "ALTER TABLE" not in ddl
     assert warns == []
+
+
+# ── Tests: detect_rename_candidates ───────────────────────────────────────────
+
+def test_rename_candidate_detected_when_unambiguous():
+    src = {"tables": {"t1": _src_table("TableSolution", [
+        _src_col("Id", "int", pos=1),
+        _src_col("Bath Surface", "float", pos=2),
+    ])}}
+    tgt = {"tables": {"tablesolution": _mysql_table("tablesolution", [
+        _mysql_col("Id", "INT", pos=1),
+        _mysql_col("surface", "DOUBLE", pos=2),
+    ])}}
+    diff = diff_schemas(src, tgt)
+    candidates = detect_rename_candidates(diff, src, tgt)
+    assert candidates["TableSolution"] == [("surface", "Bath Surface", "DOUBLE")]
+
+
+def test_no_rename_candidate_when_types_differ():
+    src = {"tables": {"t1": _src_table("MyTable", [
+        _src_col("Id", "int", pos=1),
+        _src_col("new_col", "nvarchar", max_len=50, pos=2),
+    ])}}
+    tgt = {"tables": {"mytable": _mysql_table("mytable", [
+        _mysql_col("Id", "INT", pos=1),
+        _mysql_col("old_col", "DOUBLE", pos=2),
+    ])}}
+    diff = diff_schemas(src, tgt)
+    candidates = detect_rename_candidates(diff, src, tgt)
+    assert candidates == {}
+
+
+def test_ambiguous_candidates_resolved_by_neighbors():
+    # Zwei DOUBLE-Spalten gleichzeitig entfernt/hinzugefuegt - nur das Paar
+    # mit passenden Nachbarn (gleiche Vorgaenger-/Nachfolger-Spalte) gilt.
+    src = {"tables": {"t1": _src_table("TableX", [
+        _src_col("Id", "int", pos=1),
+        _src_col("Weight New", "float", pos=2),   # Nachbarn: Id / Marker
+        _src_col("Marker", "nvarchar", max_len=10, pos=3),
+        _src_col("Other New", "float", pos=4),     # Nachbarn: Marker / Tail
+        _src_col("Tail", "int", pos=5),
+    ])}}
+    tgt = {"tables": {"tablex": _mysql_table("tablex", [
+        _mysql_col("Id", "INT", pos=1),
+        _mysql_col("Weight Old", "DOUBLE", pos=2),    # Nachbarn: Id / Marker (match)
+        _mysql_col("Marker", "VARCHAR(10)", pos=3),
+        _mysql_col("Unrelated Old", "DOUBLE", pos=4), # Nachbarn: Marker / DifferentTail
+        _mysql_col("DifferentTail", "INT", pos=5),
+    ])}}
+    diff = diff_schemas(src, tgt)
+    candidates = detect_rename_candidates(diff, src, tgt)
+    # DOUBLE ist mehrdeutig -> nur das Nachbar-passende Paar zaehlt;
+    # INT (DifferentTail/Tail) ist je Typ eindeutig -> wird ebenfalls erkannt.
+    assert set(candidates["TableX"]) == {
+        ("Weight Old", "Weight New", "DOUBLE"),
+        ("DifferentTail", "Tail", "INT"),
+    }
+
+
+def test_ambiguous_candidates_dropped_without_neighbor_match():
+    src = {"tables": {"t1": _src_table("TableY", [
+        _src_col("New A", "float", pos=1),
+        _src_col("New B", "float", pos=2),
+    ])}}
+    tgt = {"tables": {"tabley": _mysql_table("tabley", [
+        _mysql_col("Old A", "DOUBLE", pos=1),
+        _mysql_col("Old B", "DOUBLE", pos=2),
+    ])}}
+    diff = diff_schemas(src, tgt)
+    candidates = detect_rename_candidates(diff, src, tgt)
+    assert candidates == {}
+
+
+def test_generate_diff_ddl_emits_update_for_confirmed_rename():
+    src = {"tables": {"t1": _src_table("TableSolution", [
+        _src_col("Id", "int", pos=1),
+        _src_col("Bath Surface", "float", pos=2),
+    ])}}
+    tgt = {"tables": {"tablesolution": _mysql_table("tablesolution", [
+        _mysql_col("Id", "INT", pos=1),
+        _mysql_col("surface", "DOUBLE", pos=2),
+    ])}}
+    diff = diff_schemas(src, tgt)
+    rename_pairs = {"TableSolution": [("surface", "Bath Surface")]}
+    ddl, _ = generate_diff_ddl(diff, src, "testdb", rename_pairs)
+    assert "ADD COLUMN `Bath Surface`" in ddl
+    assert "UPDATE `TableSolution` SET `Bath Surface` = `surface`;" in ddl
+    assert "DROP COLUMN `surface`;" in ddl
+    # Reihenfolge: erst Spalte anlegen, dann Werte kopieren, dann alte loeschen
+    assert (
+        ddl.index("ADD COLUMN `Bath Surface`")
+        < ddl.index("UPDATE `TableSolution`")
+        < ddl.index("DROP COLUMN `surface`")
+    )
+    # Umbenannte Spalte taucht nicht mehr in der "nicht geloescht"-Warnung auf
+    assert "Spalte:  TableSolution.surface" not in ddl
+
+
+def test_generate_diff_ddl_unrenamed_removed_column_still_warned():
+    # Eine entfernte Spalte, die NICHT als Umbenennung bestaetigt wurde,
+    # bleibt weiterhin in der Warnung am Ende.
+    src = {"tables": {"t1": _src_table("TableSolution", [
+        _src_col("Id", "int", pos=1),
+        _src_col("Bath Surface", "float", pos=2),
+    ])}}
+    tgt = {"tables": {"tablesolution": _mysql_table("tablesolution", [
+        _mysql_col("Id", "INT", pos=1),
+        _mysql_col("surface", "DOUBLE", pos=2),
+        _mysql_col("Unrelated", "DOUBLE", pos=3),
+    ])}}
+    diff = diff_schemas(src, tgt)
+    rename_pairs = {"TableSolution": [("surface", "Bath Surface")]}
+    ddl, _ = generate_diff_ddl(diff, src, "testdb", rename_pairs)
+    assert "DROP COLUMN `surface`;" in ddl
+    assert "Spalte:  TableSolution.Unrelated" in ddl
+
+
+def test_generate_diff_ddl_without_rename_pairs_unchanged():
+    src = {"tables": {"t1": _src_table("MyTable", [
+        _src_col("id", "int"),
+        _src_col("extra", "nvarchar", max_len=50),
+    ])}}
+    tgt = {"tables": {"mytable": _mysql_table("mytable", [_mysql_col("id", "INT")])}}
+    diff = diff_schemas(src, tgt)
+    ddl, _ = generate_diff_ddl(diff, src, "testdb")
+    assert "UPDATE" not in ddl
 
 
 # ── Tests: format_diff_summary ────────────────────────────────────────────────
