@@ -23,7 +23,7 @@ from migrate_data import (get_table_list, migrate_all, CHUNK_SIZE,
                           checkpoint_exists, delete_checkpoint, load_checkpoint)
 from schema_diff  import (read_mysql_schema, diff_schemas,
                           generate_diff_ddl, format_diff_summary,
-                          get_tables_to_refresh)
+                          get_tables_to_refresh, detect_rename_candidates)
 
 try:
     import mysql.connector
@@ -342,6 +342,24 @@ class App(tk.Tk):
                 fh.write(f"=== Log geleert  {datetime.datetime.now():%Y-%m-%d %H:%M:%S} ===\n")
         except OSError:
             pass
+
+    def _ask_yes_no_threadsafe(self, title: str, message: str) -> bool:
+        """messagebox.askyesno() aus einem Hintergrund-Thread (task()) heraus.
+
+        Tkinter-Dialoge dürfen nur im Main-Thread geöffnet werden. self.after(0, …)
+        schiebt den Dialog in den Main-Loop, ein Event blockiert den Worker-Thread
+        bis die Antwort da ist.
+        """
+        done   = threading.Event()
+        answer = {"value": False}
+
+        def ask():
+            answer["value"] = messagebox.askyesno(title, message)
+            done.set()
+
+        self.after(0, ask)
+        done.wait()
+        return answer["value"]
 
     # ── Fortschritt / Cancel ─────────────────────────────────────────────
     # ── Fortschritt-Hilfsmethoden ────────────────────────────────────────
@@ -720,6 +738,14 @@ class App(tk.Tk):
                                 return
                         elif dry_run:
                             # Dry-Run: Diff + Datenvorschau anzeigen
+                            rename_candidates = detect_rename_candidates(
+                                diff_result, self._schema, mysql_schema
+                            )
+                            if rename_candidates:
+                                self.log("── Mögliche Umbenennungen (im echten Deploy würde gefragt):")
+                                for rtbl, pairs in rename_candidates.items():
+                                    for old_name, new_name, mtype in pairs:
+                                        self.log(f"  ? {rtbl}.{old_name} → {new_name} ({mtype})")
                             if self._transfer_data_var.get():
                                 refresh_set = get_tables_to_refresh(diff_result)
                                 if data_scope == "diff":
@@ -733,7 +759,33 @@ class App(tk.Tk):
                             self.after(0, self._progress_finish, "Dry-Run: Diff OK ✓", True, 3000)
                             return
                         else:
-                            diff_ddl, _ = generate_diff_ddl(diff_result, self._schema, target_db)
+                            rename_candidates = detect_rename_candidates(
+                                diff_result, self._schema, mysql_schema
+                            )
+                            confirmed_renames: dict = {}
+                            for rtbl, pairs in rename_candidates.items():
+                                for old_name, new_name, mtype in pairs:
+                                    if self._ask_yes_no_threadsafe(
+                                        "Mögliche Spalten-Umbenennung",
+                                        f"Tabelle '{rtbl}':\n"
+                                        f"Spalte '{old_name}' wurde entfernt, "
+                                        f"'{new_name}' ist neu (beide Typ {mtype}).\n\n"
+                                        f"Handelt es sich um eine Umbenennung?\n"
+                                        f"Falls ja, werden die bestehenden Werte automatisch "
+                                        f"übernommen:\n"
+                                        f"UPDATE `{rtbl}` SET `{new_name}` = `{old_name}`;",
+                                    ):
+                                        confirmed_renames.setdefault(rtbl, []).append(
+                                            (old_name, new_name)
+                                        )
+                                        self.log(
+                                            f"  → Umbenennung bestätigt: "
+                                            f"{rtbl}.{old_name} → {new_name}"
+                                        )
+
+                            diff_ddl, _ = generate_diff_ddl(
+                                diff_result, self._schema, target_db, confirmed_renames
+                            )
                             self.after(0, self._show_diff_ddl, diff_ddl)
 
                             self.after(0, self._progress_start_determinate, "Schema-Diff deployen …")

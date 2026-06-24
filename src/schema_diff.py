@@ -53,7 +53,7 @@ def read_mysql_schema(conn, db_name: str) -> Dict[str, Any]:
         ORDER  BY c.TABLE_NAME, c.ORDINAL_POSITION
     """, (db_name,))
 
-    for tname, cname, ctype, nullable, default, extra, _ in cur.fetchall():
+    for tname, cname, ctype, nullable, default, extra, pos in cur.fetchall():
         if tname not in schema["tables"]:
             schema["tables"][tname] = {
                 "columns": {},
@@ -66,6 +66,7 @@ def read_mysql_schema(conn, db_name: str) -> Dict[str, Any]:
             "nullable":    (nullable == "YES"),
             "default":     default,
             "auto_increment": ("auto_increment" in (extra or "").lower()),
+            "pos":         pos,
         }
 
     # ── Primary Keys (nur BASE TABLE) ────────────────────────────────────
@@ -252,7 +253,8 @@ def diff_schemas(source: dict, target_mysql: dict) -> dict:
         removed = [k for k in tgt_cols if k not in src_cols]
         if removed:
             diff["removed_columns"][tbl_name] = [
-                tgt["columns"][c] for c in tgt["columns"] if c.lower() in removed
+                {**tgt["columns"][c], "name": c}
+                for c in tgt["columns"] if c.lower() in removed
             ]
             for c in removed:
                 diff["warnings"].append(
@@ -287,11 +289,113 @@ def diff_schemas(source: dict, target_mysql: dict) -> dict:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  Umbenennungs-Kandidaten erkennen (entfernte + neue Spalte = Rename?)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _ordered_column_names(names_with_pos: List[Tuple[str, Any]]) -> List[str]:
+    return [name for name, _ in sorted(names_with_pos, key=lambda kv: kv[1] or 0)]
+
+
+def _neighbors(ordered_names: List[str], name: str) -> Tuple[Optional[str], Optional[str]]:
+    """Liefert (Vorgänger, Nachfolger) von `name` in `ordered_names` (lowercase)."""
+    lname = name.lower()
+    try:
+        i = next(idx for idx, n in enumerate(ordered_names) if n.lower() == lname)
+    except StopIteration:
+        return (None, None)
+    prev_ = ordered_names[i - 1].lower() if i > 0 else None
+    next_ = ordered_names[i + 1].lower() if i + 1 < len(ordered_names) else None
+    return (prev_, next_)
+
+
+def detect_rename_candidates(
+    diff: dict, source_schema: dict, target_mysql: dict
+) -> Dict[str, List[Tuple[str, str, str]]]:
+    """Erkennt pro Tabelle Spalten, die vermutlich nur umbenannt wurden.
+
+    Eine entfernte Spalte (existiert in MySQL, nicht mehr in der MDF) und
+    eine neue Spalte (existiert in der MDF, nicht in MySQL) gelten als
+    Umbenennungs-Kandidat, wenn ihr MySQL-Zieltyp identisch ist.
+
+    Gibt es pro Tabelle mehr als ein Kandidatenpaar mit passendem Typ, ist
+    die Zuordnung unsicher (z.B. zwei DOUBLE-Spalten gleichzeitig entfernt
+    und hinzugefügt). In diesem Fall wird zusätzlich verlangt, dass die
+    Vorgänger- und Nachfolger-Spalte (Position -1/+1) beider Seiten
+    übereinstimmen – andernfalls wird das Paar verworfen, da der Bezug zu
+    unsicher ist.
+
+    Returns
+    -------
+    {table_name: [(alter_name, neuer_name, mysql_typ), ...]}
+    """
+    src_tables_by_name = {t["name"]: t for t in source_schema.get("tables", {}).values()}
+    candidates: Dict[str, List[Tuple[str, str, str]]] = {}
+
+    for tbl_name, changes in diff["altered_tables"].items():
+        removed_cols = diff["removed_columns"].get(tbl_name, [])
+        new_cols     = changes["new_columns"]
+        if not removed_cols or not new_cols:
+            continue
+
+        src_tinfo = src_tables_by_name.get(tbl_name)
+        tgt_tinfo = (
+            target_mysql["tables"].get(tbl_name)
+            or target_mysql["tables"].get(tbl_name.lower())
+        )
+        if not src_tinfo or not tgt_tinfo:
+            continue
+
+        # Kandidatenpaare nach übereinstimmendem Typ gruppieren - Mehrdeutigkeit
+        # (mehrere Kandidaten desselben Typs) wird pro Typ einzeln beurteilt,
+        # damit ein eindeutiges INT-Paar nicht an einem mehrdeutigen
+        # DOUBLE-Paar in derselben Tabelle scheitert.
+        pairs_by_type: Dict[str, List[Tuple[str, str]]] = {}
+        for old in removed_cols:
+            old_type = _normalize_mysql_type(old["type"])
+            for new in new_cols:
+                new_type = _source_mysql_type(new)
+                if old_type == new_type:
+                    pairs_by_type.setdefault(new_type, []).append((old["name"], new["name"]))
+
+        if not pairs_by_type:
+            continue
+
+        src_names = _ordered_column_names(
+            [(c["name"], c.get("pos")) for c in src_tinfo["columns"]]
+        )
+        tgt_names = _ordered_column_names(
+            [(n, c.get("pos")) for n, c in tgt_tinfo["columns"].items()]
+        )
+
+        for mtype, type_pairs in pairs_by_type.items():
+            if len(type_pairs) == 1:
+                old_name, new_name = type_pairs[0]
+                candidates.setdefault(tbl_name, []).append((old_name, new_name, mtype))
+                continue
+            # Mehrdeutig: nur Paare behalten, deren Nachbar-Spalten übereinstimmen
+            for old_name, new_name in type_pairs:
+                if _neighbors(tgt_names, old_name) == _neighbors(src_names, new_name):
+                    candidates.setdefault(tbl_name, []).append((old_name, new_name, mtype))
+
+    return candidates
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  DDL aus Diff generieren
 # ════════════════════════════════════════════════════════════════════════════
 
-def generate_diff_ddl(diff: dict, source_schema: dict, target_db: str) -> Tuple[str, List[str]]:
+def generate_diff_ddl(
+    diff: dict,
+    source_schema: dict,
+    target_db: str,
+    rename_pairs: Optional[Dict[str, List[Tuple[str, str]]]] = None,
+) -> Tuple[str, List[str]]:
     """Erzeugt inkrementelles DDL aus einem diff_schemas()-Ergebnis.
+
+    `rename_pairs` (von detect_rename_candidates(), nach User-Bestätigung):
+    {table_name: [(alter_name, neuer_name), ...]}. Für jedes Paar wird nach
+    dem ADD COLUMN ein `UPDATE ... SET neu = alt;` ergänzt, damit die
+    bestehenden Werte in die umbenannte Spalte übernommen werden.
 
     Returns
     -------
@@ -299,6 +403,7 @@ def generate_diff_ddl(diff: dict, source_schema: dict, target_db: str) -> Tuple[
     """
     from transform import convert_default, generate_mysql_ddl
 
+    rename_pairs = rename_pairs or {}
     lines: List[str] = [
         "-- Inkrementelles Schema-Update (Schema-Diff)",
         f"-- Zieldatenbank: {target_db}",
@@ -346,6 +451,16 @@ def generate_diff_ddl(diff: dict, source_schema: dict, target_db: str) -> Tuple[
                 f"ALTER TABLE {mssql_name(tbl_name)} "
                 f"ADD COLUMN {mssql_name(col['name'])} "
                 f"{mysql_type}{null_str}{auto_str}{def_str};"
+            )
+
+        # Umbenennungen (User-bestätigt): bestehende Werte übernehmen
+        for old_name, new_name in rename_pairs.get(tbl_name, []):
+            lines.append(
+                f"-- Umbenennung übernommen: {tbl_name}.{old_name} → {new_name}"
+            )
+            lines.append(
+                f"UPDATE {mssql_name(tbl_name)} "
+                f"SET {mssql_name(new_name)} = {mssql_name(old_name)};"
             )
 
         # Geänderte Spaltentypen
