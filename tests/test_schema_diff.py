@@ -99,6 +99,36 @@ def test_type_change_generates_warning():
     assert any("amount" in w for w in diff["warnings"])
 
 
+def test_tinyint_display_width_is_not_a_real_type_change():
+    # TINYINT(3) UNSIGNED (alte MySQL-Spalte) und TINYINT UNSIGNED (vom
+    # Generator erzeugt) sind funktional identisch - die Display-Width
+    # wird seit MySQL 8/MariaDB ignoriert. Ohne Normalisierung wurde das
+    # bei jedem Schema-Diff-Lauf faelschlich als Typ-Aenderung gemeldet.
+    src = {"tables": {"t1": _src_table("TableSolution", [
+        _src_col("Suitable Resins", "tinyint"),
+    ])}}
+    tgt = {"tables": {"tablesolution": _mysql_table("tablesolution", [
+        _mysql_col("Suitable Resins", "TINYINT(3) UNSIGNED"),
+    ])}}
+    diff = diff_schemas(src, tgt)
+    assert diff["altered_tables"] == {}
+    assert diff["warnings"] == []
+
+
+def test_tinyint_1_display_width_still_kept_distinct_from_plain_tinyint():
+    # TINYINT(1) entspricht BIT/bool und darf nicht mit TINYINT (ohne
+    # Bool-Bedeutung) gleichgesetzt werden.
+    src = {"tables": {"t1": _src_table("MyTable", [
+        _src_col("flag", "bit"),
+    ])}}
+    tgt = {"tables": {"mytable": _mysql_table("mytable", [
+        _mysql_col("flag", "TINYINT(3) UNSIGNED"),
+    ])}}
+    diff = diff_schemas(src, tgt)
+    mods = diff["altered_tables"]["MyTable"]["modified_columns"]
+    assert mods[0] == ("flag", "TINYINT UNSIGNED", "TINYINT(1)")
+
+
 def test_removed_table_only_warns():
     src = {"tables": {}}
     tgt = {"tables": {"oldie": _mysql_table("oldie", [_mysql_col("id", "INT")])}}

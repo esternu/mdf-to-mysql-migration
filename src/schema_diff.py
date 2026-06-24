@@ -148,6 +148,11 @@ def _normalize_mysql_type(t: str) -> str:
     t = re.sub(r'\bINT\(\d+\)',     'INT',     t)
     t = re.sub(r'\bBIGINT\(\d+\)',  'BIGINT',  t)
     t = re.sub(r'\bSMALLINT\(\d+\)','SMALLINT',t)
+    t = re.sub(
+        r'\bTINYINT\((\d+)\)',
+        lambda m: 'TINYINT(1)' if m.group(1) == '1' else 'TINYINT',
+        t,
+    )
     return t
 
 
