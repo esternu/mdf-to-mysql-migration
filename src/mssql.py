@@ -315,6 +315,8 @@ def read_schema(session: MdfSession, log) -> dict:
             })
 
     # ── Indexes (UNIQUE + Non-Clustered, ohne PKs) ────────────────────────
+    # Erfasst auch table-level UNIQUE CONSTRAINTs (is_unique_constraint=1) -
+    # fuer MySQL ist eine UNIQUE CONSTRAINT identisch zu einem UNIQUE INDEX.
     log("Lese Indexes …")
     cur.execute("""
         SELECT
@@ -332,7 +334,6 @@ def read_schema(session: MdfSession, log) -> dict:
                                    AND ic.index_id  = i.index_id
         WHERE i.type              = 2              -- 2 = NONCLUSTERED
           AND i.is_primary_key    = 0
-          AND i.is_unique_constraint = 0           -- separate von UNIQUE CONSTRAINT
           AND ic.is_included_column  = 0           -- nur Schlüsselspalten
           AND OBJECT_SCHEMA_NAME(i.object_id) != 'sys'
         ORDER BY tschema, tname, iname, ic.key_ordinal

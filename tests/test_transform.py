@@ -13,6 +13,8 @@ from transform import (
     generate_mysql_ddl,
     _topo_sort_views,
     _convert_string_concat,
+    render_index_ddl,
+    _parse_simple_equality_filter,
 )
 
 
@@ -480,6 +482,69 @@ _FK_SCHEMA = {
     },
     "views": {},
 }
+
+
+class TestParseSimpleEqualityFilter:
+    def test_parses_bracket_int_filter(self):
+        assert _parse_simple_equality_filter("([IsDefault]=(1))") == ("IsDefault", "1")
+
+    def test_parses_without_extra_parens(self):
+        assert _parse_simple_equality_filter("[Active]=(0)") == ("Active", "0")
+
+    def test_none_input_returns_none(self):
+        assert _parse_simple_equality_filter(None) is None
+
+    def test_unrecognized_pattern_returns_none(self):
+        # Bereich-/IN-Filter etc. werden nicht unterstuetzt
+        assert _parse_simple_equality_filter("([Status] IN (1,2))") is None
+
+
+class TestRenderIndexDdl:
+    def test_plain_index_unchanged(self):
+        idx = {"name": "IX_Foo", "unique": False, "filter": None,
+               "columns": [{"name": "Bar", "desc": False}]}
+        lines = render_index_ddl("MyTable", idx)
+        assert lines == ["CREATE INDEX `IX_Foo` ON `MyTable` (`Bar` ASC);"]
+
+    def test_plain_unique_index_unchanged(self):
+        idx = {"name": "UX_Foo", "unique": True, "filter": None,
+               "columns": [{"name": "A", "desc": False}, {"name": "B", "desc": False}]}
+        lines = render_index_ddl("MyTable", idx)
+        assert lines == ["CREATE UNIQUE INDEX `UX_Foo` ON `MyTable` (`A` ASC, `B` ASC);"]
+
+    def test_filtered_unique_index_emulated_via_generated_column(self):
+        # Der reale Fall: TablePlatingRate.UX_TablePlatingRate_OneDefault
+        # WHERE [IsDefault] = 1  ->  darf NICHT zu einem unkonditionalen
+        # UNIQUE(PlatingId) werden (das war der Übersetzungsfehler).
+        idx = {"name": "UX_TablePlatingRate_OneDefault", "unique": True,
+               "filter": "([IsDefault]=(1))",
+               "columns": [{"name": "PlatingId", "desc": False}]}
+        lines = render_index_ddl("TablePlatingRate", idx)
+        ddl = "\n".join(lines)
+        assert "ADD COLUMN `_UX_TablePlatingRate_OneDefault_key`" in ddl
+        assert "GENERATED ALWAYS AS (IF(`IsDefault` = 1, `PlatingId`, NULL)) VIRTUAL" in ddl
+        assert "CREATE UNIQUE INDEX `UX_TablePlatingRate_OneDefault` ON `TablePlatingRate` (`_UX_TablePlatingRate_OneDefault_key`);" in ddl
+        # Die ALTER-Anweisung fuer die generierte Spalte muss vor dem Index stehen
+        assert ddl.index("ADD COLUMN") < ddl.index("CREATE UNIQUE INDEX")
+        # Keine falsche "gleichwertig"-Behauptung mehr ohne echte Emulation
+        assert "gleichwertiges Verhalten" not in ddl
+
+    def test_filtered_index_with_multiple_columns_uses_concat(self):
+        idx = {"name": "UX_Multi", "unique": True, "filter": "([Flag]=(1))",
+               "columns": [{"name": "A", "desc": False}, {"name": "B", "desc": False}]}
+        lines = render_index_ddl("T", idx)
+        ddl = "\n".join(lines)
+        assert "CONCAT_WS('|', `A`, `B`)" in ddl
+
+    def test_unrecognized_filter_emits_warning_not_wrong_index(self):
+        idx = {"name": "UX_Weird", "unique": True, "filter": "([Status] IN (1,2))",
+               "columns": [{"name": "PlatingId", "desc": False}]}
+        lines = render_index_ddl("T", idx)
+        ddl = "\n".join(lines)
+        assert "⚠" in ddl
+        assert "manuell" in ddl.lower()
+        # Es darf kein unkonditionaler UNIQUE-Index erzeugt werden
+        assert "CREATE UNIQUE INDEX `UX_Weird` ON `T` (`PlatingId` ASC);" in ddl
 
 
 class TestGenerateMysqlDdl:

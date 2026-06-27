@@ -6,7 +6,7 @@ Enthält:
   - DDL-Generierung    (generate_mysql_ddl, _topo_sort_views)
 """
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # Views, die nicht uebersetzt werden: ViewAuditChanges basiert auf MSSQL-
 # spezifischem OPENJSON/FULL OUTER JOIN und wird durch die Audit-Trigger
@@ -389,6 +389,85 @@ def _topo_sort_views(views: dict) -> list:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  Gefilterte (partielle) Indexe - MySQL kennt kein WHERE bei CREATE INDEX
+# ════════════════════════════════════════════════════════════════════════════
+_SIMPLE_EQ_FILTER_RE = re.compile(r'^\(*\[([^\]]+)\]\s*=\s*\(*([^()]+)\)*$')
+
+
+def _parse_simple_equality_filter(filter_def: Optional[str]) -> Optional[Tuple[str, str]]:
+    """Erkennt SQL-Server-Filterausdrücke der Form '([IsDefault]=(1))'.
+
+    Gibt (Spaltenname, Wert) zurück, oder None wenn das Muster nicht
+    (eindeutig) erkannt wird - dann muss der Index manuell nachgebaut werden.
+    """
+    if not filter_def:
+        return None
+    m = _SIMPLE_EQ_FILTER_RE.match(filter_def.strip())
+    if not m:
+        return None
+    return m.group(1), m.group(2)
+
+
+def render_index_ddl(table_name: str, idx: dict) -> List[str]:
+    """Erzeugt die DDL-Zeile(n) für einen Index, inkl. Emulation gefilterter
+    (partieller) UNIQUE-Indexe.
+
+    MySQL/MariaDB kennt kein `CREATE INDEX ... WHERE ...`. Ein gefilterter
+    SQL-Server-UNIQUE-Index der Form `WHERE [Spalte] = <Wert>` wird daher über
+    eine generierte (virtuelle) Spalte emuliert: Die Spalte liefert die
+    Indexwerte nur für Zeilen, die den Filter erfüllen, sonst NULL - und
+    MySQL UNIQUE erlaubt beliebig viele NULLs, womit nur die gefilterten
+    Zeilen tatsächlich eindeutig sein müssen (= identisches Verhalten).
+
+    Kann der Filter nicht erkannt werden, wird eine Warnung ausgegeben statt
+    eines (möglicherweise falschen) unkonditionalen UNIQUE-Index.
+    """
+    safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', idx["name"])
+    unique_kw = "UNIQUE " if idx["unique"] else ""
+    col_list  = ", ".join(
+        f"{mssql_name(c['name'])} {'DESC' if c['desc'] else 'ASC'}"
+        for c in idx["columns"]
+    )
+    lines: List[str] = []
+
+    if idx.get("filter"):
+        parsed = _parse_simple_equality_filter(idx["filter"])
+        if parsed and idx["unique"]:
+            filter_col, filter_val = parsed
+            key_col = f"_{safe_name}_key"
+            if len(idx["columns"]) == 1:
+                source_expr = mssql_name(idx["columns"][0]["name"])
+            else:
+                source_expr = "CONCAT_WS('|', " + ", ".join(
+                    mssql_name(c["name"]) for c in idx["columns"]
+                ) + ")"
+            lines.append(
+                f"-- Gefilterter Index (urspr. WHERE [{filter_col}] = {filter_val}) "
+                f"-> als generierte Spalte emuliert (MySQL kennt keine partiellen Indexe)"
+            )
+            lines.append(
+                f"ALTER TABLE {mssql_name(table_name)} ADD COLUMN `{key_col}` "
+                f"VARCHAR(255) GENERATED ALWAYS AS "
+                f"(IF({mssql_name(filter_col)} = {filter_val}, {source_expr}, NULL)) VIRTUAL;"
+            )
+            lines.append(
+                f"CREATE {unique_kw}INDEX `{safe_name}` ON {mssql_name(table_name)} (`{key_col}`);"
+            )
+            return lines
+        else:
+            lines.append(
+                f"-- ⚠ Gefilterter Index (urspr. WHERE {idx['filter']}) konnte nicht "
+                f"automatisch übersetzt werden - MySQL kennt keine partiellen Indexe. "
+                f"Manuell prüfen!"
+            )
+
+    lines.append(
+        f"CREATE {unique_kw}INDEX `{safe_name}` ON {mssql_name(table_name)} ({col_list});"
+    )
+    return lines
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  DDL-Generierung
 # ════════════════════════════════════════════════════════════════════════════
 def generate_mysql_ddl(schema: dict, target_db: str) -> str:
@@ -448,22 +527,7 @@ def generate_mysql_ddl(schema: dict, target_db: str) -> str:
         lines.append("-- Indexes")
     for tinfo in schema["tables"].values():
         for idx in tinfo.get("indexes", []):
-            safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', idx["name"])
-            unique_kw = "UNIQUE " if idx["unique"] else ""
-            col_list  = ", ".join(
-                f"{mssql_name(c['name'])} {'DESC' if c['desc'] else 'ASC'}"
-                for c in idx["columns"]
-            )
-            if idx["filter"]:
-                safe_filter = idx["filter"].replace(";", "")
-                lines.append(
-                    f"-- Gefilterter Index (urspr. WHERE {safe_filter})"
-                    f" -- MySQL UNIQUE erlaubt mehrere NULLs, gleichwertiges Verhalten"
-                )
-            lines.append(
-                f"CREATE {unique_kw}INDEX `{safe_name}` "
-                f"ON {mssql_name(tinfo['name'])} ({col_list});"
-            )
+            lines.extend(render_index_ddl(tinfo["name"], idx))
     if has_indexes:
         lines.append("")
 
