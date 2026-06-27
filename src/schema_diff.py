@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from transform import convert_type, mssql_name
+from transform import convert_type, mssql_name, render_index_ddl
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -484,16 +484,7 @@ def generate_diff_ddl(
 
         # Neue Indexes
         for idx in changes["new_indexes"]:
-            safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', idx["name"])
-            unique_kw = "UNIQUE " if idx["unique"] else ""
-            col_list  = ", ".join(
-                f"{mssql_name(c['name'])} {'DESC' if c['desc'] else 'ASC'}"
-                for c in idx["columns"]
-            )
-            lines.append(
-                f"CREATE {unique_kw}INDEX `{safe_name}` "
-                f"ON {mssql_name(tbl_name)} ({col_list});"
-            )
+            lines.extend(render_index_ddl(tbl_name, idx))
 
         # Neue Foreign Keys
         for fk in changes["new_fks"]:
