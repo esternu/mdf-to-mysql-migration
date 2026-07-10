@@ -1,10 +1,21 @@
 # Review: `audit_triggers_<db>.sql` — Punch-Liste für den Generator
 
+> **Status: ✅ ERLEDIGT** — alle Punkte P1–P5 wurden mit
+> [Issue #23 / PR #24](https://github.com/esternu/mdf-to-mysql-migration/pull/24)
+> in `src/audit_triggers.py` umgesetzt (P1 JSON-Pfad-Quoting, P2 BLOB-Ausschluss,
+> P3 `CREATE TABLE IF NOT EXISTS`, P4 lokale Trigger-Variablen, P5 PK-Änderungs-Logging).
+> Dieses Dokument bleibt als Begründung der Design-Entscheidungen erhalten.
+>
+> **Noch offen (anderes Repo):** Der zweite Teil von P3 — der kanonische
+> WCEP-Dump `WCEP/Tools/schema/Cockpit_DatenBank.sql` definiert `TableAuditLog`
+> weiterhin als `Id INT` + `LONGTEXT` statt `Id BIGINT` + `JSON`. Angleichung
+> gehört ins WCEP-Repo.
+
 Bewertung der von `mdf-to-mysql-migration` erzeugten Datei
 `Tools/schema/audit_triggers_Cockpit_Datenbank.sql` (Stand: 13 Tabellen ×
 INSERT/UPDATE/DELETE, JSON-Payload, Delta-Logging beim UPDATE).
 
-**Verdikt:** tragfähiger Ansatz, aber **vor Produktiveinsatz müssen P1–P3
+**Verdikt (ursprünglich):** tragfähiger Ansatz, aber **vor Produktiveinsatz müssen P1–P3
 behoben werden** — sonst schlagen UPDATEs auf ~der Hälfte der Tabellen fehl und
 Bild-Tabellen brechen. Alle Fixes gehören in den **Generator**, nicht in die
 generierte `.sql`.
