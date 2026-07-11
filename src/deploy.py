@@ -105,7 +105,7 @@ def deploy_to_mysql(
     progress_callback(done, total) wird nach jeder ausgeführten Anweisung aufgerufen.
     """
     log(f"Verbinde mit MySQL {host}:{port} …")
-    conn = mysql.connector.connect(
+    conn_kwargs = dict(
         host=host,
         port=port,
         user=user,
@@ -115,6 +115,18 @@ def deploy_to_mysql(
         charset="utf8mb4",
         connection_timeout=10,
     )
+    try:
+        conn = mysql.connector.connect(**conn_kwargs)
+    except mysql.connector.Error as e:
+        # 1049 = Unknown database: beim allerersten Voll-Deploy existiert die
+        # Ziel-DB noch nicht - das DDL legt sie selbst an (CREATE DATABASE +
+        # USE). Ohne database verbinden und das DDL die DB waehlen lassen.
+        if getattr(e, "errno", None) != 1049:
+            raise
+        log(f"Datenbank '{target_db}' existiert noch nicht – "
+            f"verbinde ohne Datenbankauswahl (DDL legt sie an).")
+        conn_kwargs.pop("database")
+        conn = mysql.connector.connect(**conn_kwargs)
     cur = conn.cursor()
 
     statements = _split_statements(ddl)
