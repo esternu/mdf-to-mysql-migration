@@ -96,6 +96,23 @@ class TestConvertType:
     def test_varbinary(self):
         assert convert_type("varbinary", None, None, None) == "LONGBLOB"
 
+    # ── binary/varbinary mit Laenge (TODO 2.5) ───────────────────────────
+    def test_varbinary_max_is_longblob(self):
+        assert convert_type("varbinary", -1, None, None) == "LONGBLOB"
+
+    def test_binary_keeps_length(self):
+        # binary(16) darf NICHT zu BINARY(1) degradieren (Trunkierung!)
+        assert convert_type("binary", 16, None, None) == "BINARY(16)"
+
+    def test_binary_length_capped_at_255(self):
+        assert convert_type("binary", 400, None, None) == "BINARY(255)"
+
+    def test_varbinary_keeps_length(self):
+        assert convert_type("varbinary", 128, None, None) == "VARBINARY(128)"
+
+    def test_varbinary_huge_becomes_longblob(self):
+        assert convert_type("varbinary", 70000, None, None) == "LONGBLOB"
+
     def test_xml(self):
         assert convert_type("xml", None, None, None) == "LONGTEXT"
 
