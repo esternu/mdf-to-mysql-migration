@@ -449,6 +449,16 @@ def convert_view_sql(tsql: str) -> tuple:
     # ── T-SQL String-Konkatenation (+) → MySQL CONCAT() ───────────────────
     sql = _convert_string_concat(sql)
 
+    # Verbleibende '+' neben String-Literalen = nicht erkannte Kette
+    # (z.B. CAST mit 2 Klammer-Ebenen). In MySQL rechnet '+' NUMERISCH -
+    # 'text' + x ergibt still 0/Unsinn statt Konkatenation → warnen!
+    if re.search(r"'[^']*'\s*\+|\+\s*'[^']*'", sql):
+        warnings.append(
+            "String-Konkatenation mit '+' konnte nicht vollstaendig zu "
+            "CONCAT() konvertiert werden - MySQL wuerde numerisch rechnen! "
+            "Betroffene Stellen manuell auf CONCAT() umbauen."
+        )
+
     # ── STRING_AGG → GROUP_CONCAT ─────────────────────────────────────────
     def _string_agg_repl(m: re.Match) -> str:
         expr      = m.group(1).strip()

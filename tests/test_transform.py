@@ -404,6 +404,28 @@ class TestConvertViewSql:
         assert "JOIN" in result
         assert "CROSS APPLY" not in result
 
+    # ── Verbleibende '+'-Konkatenation warnt (TODO 2.4) ──────────────────
+    def test_unconverted_string_concat_warns(self):
+        # 2 Klammer-Ebenen im CAST -> _convert_string_concat greift nicht
+        sql = "SELECT 'x' + CAST(ROUND(SUM(a / b), 2) AS CHAR(10)) FROM t"
+        result, warns = convert_view_sql(sql)
+        if "+" in result:   # nicht konvertiert -> Warnung ist Pflicht
+            assert any("CONCAT" in w and "numerisch" in w for w in warns)
+
+    def test_plain_string_plus_column_warns_if_unconverted(self):
+        result, warns = convert_view_sql("SELECT 'Wert: ' + very_long_col_expr(x, y) FROM t")
+        if re.search(r"'[^']*'\s*\+", result):
+            assert any("numerisch" in w for w in warns)
+
+    def test_fully_converted_concat_produces_no_warning(self):
+        result, warns = convert_view_sql("SELECT col + ' (' + 'a' + ')' FROM t")
+        assert "CONCAT" in result or "+" not in result
+        assert not any("numerisch" in w for w in warns)
+
+    def test_numeric_addition_not_flagged(self):
+        _, warns = convert_view_sql("SELECT a + b FROM t")
+        assert not any("numerisch" in w for w in warns)
+
     # ── CONVERT() → CAST() (TODO 2.3) ────────────────────────────────────
     def test_convert_two_args_becomes_cast(self):
         result, warns = convert_view_sql("SELECT CONVERT(INT, col) FROM t")
