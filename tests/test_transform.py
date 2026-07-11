@@ -332,9 +332,33 @@ class TestConvertViewSql:
         result, _ = convert_view_sql("SELECT * FROM t WITH (NOLOCK)")
         assert "NOLOCK" not in result
 
-    def test_top_removed(self):
-        result, _ = convert_view_sql("SELECT TOP 10 col FROM t")
+    def test_top_translated_to_limit(self):
+        # TODO 2.2: TOP n darf nicht ersatzlos verschwinden - LIMIT n am Ende.
+        result, warns = convert_view_sql("SELECT TOP 10 col FROM t")
         assert "TOP" not in result
+        assert result.rstrip().endswith("LIMIT 10")
+        assert any("LIMIT 10" in w for w in warns)
+
+    def test_top_in_subquery_warns_and_keeps_sql(self):
+        sql = "SELECT a FROM (SELECT TOP 5 a FROM t ORDER BY a) AS s"
+        result, warns = convert_view_sql(sql)
+        assert "TOP 5" in result            # bleibt stehen statt still zu verschwinden
+        assert any("manuell" in w for w in warns)
+
+    def test_top_percent_warns(self):
+        result, warns = convert_view_sql("SELECT TOP 10 PERCENT col FROM t")
+        assert any("PERCENT" in w or "manuell" in w for w in warns)
+        assert "LIMIT" not in result
+
+    def test_top_with_expression_warns(self):
+        result, warns = convert_view_sql("SELECT TOP (@n) col FROM t")
+        assert any("manuell" in w for w in warns)
+        assert "LIMIT" not in result
+
+    def test_no_top_no_limit(self):
+        result, warns = convert_view_sql("SELECT col FROM t")
+        assert "LIMIT" not in result
+        assert warns == []
 
     # STRING_AGG → GROUP_CONCAT
     def test_string_agg_with_order(self):
