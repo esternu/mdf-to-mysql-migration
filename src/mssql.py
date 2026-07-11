@@ -300,18 +300,22 @@ def read_schema(session: MdfSession, log) -> dict:
             COL_NAME(fkc.parent_object_id,    fkc.parent_column_id)       AS from_col,
             OBJECT_SCHEMA_NAME(fkc.referenced_object_id)                  AS to_schema,
             OBJECT_NAME(fkc.referenced_object_id)                         AS to_table,
-            COL_NAME(fkc.referenced_object_id, fkc.referenced_column_id)  AS to_col
+            COL_NAME(fkc.referenced_object_id, fkc.referenced_column_id)  AS to_col,
+            fk.delete_referential_action_desc                             AS on_delete,
+            fk.update_referential_action_desc                             AS on_update
         FROM sys.foreign_keys        fk
         JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
         ORDER BY from_schema, from_table
     """)
     for row in cur.fetchall():
-        fk_name, fs, ft, fc, ts, tt, tc = row
+        fk_name, fs, ft, fc, ts, tt, tc, on_del, on_upd = row
         key = f"{fs}.{ft}"
         if key in schema["tables"]:
             schema["tables"][key]["fk"].append({
                 "name": fk_name, "from_col": fc,
                 "to_schema": ts, "to_table": tt, "to_col": tc,
+                "on_delete": on_del or "NO_ACTION",
+                "on_update": on_upd or "NO_ACTION",
             })
 
     # ── Indexes (UNIQUE + Non-Clustered, ohne PKs) ────────────────────────

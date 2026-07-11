@@ -468,6 +468,46 @@ def render_index_ddl(table_name: str, idx: dict) -> List[str]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  Foreign-Key-Referenzaktionen (ON DELETE / ON UPDATE)
+# ════════════════════════════════════════════════════════════════════════════
+# SQL-Server-Aktionsnamen (sys.foreign_keys.*_referential_action_desc) →
+# MySQL-Klausel. NO_ACTION wird weggelassen (MySQL-Default RESTRICT verhaelt
+# sich identisch). SET_DEFAULT kennt InnoDB nicht → Warnkommentar statt Klausel.
+_FK_ACTION_SQL = {
+    "CASCADE":     "CASCADE",
+    "SET_NULL":    "SET NULL",
+    "SET NULL":    "SET NULL",
+}
+
+
+def fk_actions_sql(fk: dict) -> Tuple[str, List[str]]:
+    """Erzeugt die ON DELETE/ON UPDATE-Klauseln eines FK-Eintrags.
+
+    Returns
+    -------
+    (suffix, warnings)
+        suffix    – z.B. " ON DELETE CASCADE" (leer wenn beide NO_ACTION)
+        warnings  – Hinweise fuer nicht abbildbare Aktionen (SET_DEFAULT)
+    """
+    parts: List[str] = []
+    warns: List[str] = []
+    for key, clause in (("on_delete", "ON DELETE"), ("on_update", "ON UPDATE")):
+        action = (fk.get(key) or "NO_ACTION").upper()
+        if action in ("NO_ACTION", "NO ACTION", "RESTRICT"):
+            continue
+        mapped = _FK_ACTION_SQL.get(action)
+        if mapped:
+            parts.append(f"{clause} {mapped}")
+        else:
+            warns.append(
+                f"FK {fk['name']}: {clause} {action} wird von MySQL/InnoDB "
+                f"nicht unterstuetzt - Klausel weggelassen, manuell pruefen!"
+            )
+    suffix = (" " + " ".join(parts)) if parts else ""
+    return suffix, warns
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  DDL-Generierung
 # ════════════════════════════════════════════════════════════════════════════
 def generate_mysql_ddl(schema: dict, target_db: str) -> str:
@@ -509,11 +549,15 @@ def generate_mysql_ddl(schema: dict, target_db: str) -> str:
     for tinfo in schema["tables"].values():
         for fk in tinfo["fk"]:
             safe_fk = re.sub(r'[^a-zA-Z0-9_]', '_', fk["name"])
+            actions, fk_warns = fk_actions_sql(fk)
+            for w in fk_warns:
+                lines.append(f"-- ⚠ {w}")
             lines.append(
                 f"ALTER TABLE {mssql_name(tinfo['name'])} "
                 f"ADD CONSTRAINT `{safe_fk}` "
                 f"FOREIGN KEY ({mssql_name(fk['from_col'])}) "
-                f"REFERENCES {mssql_name(fk['to_table'])} ({mssql_name(fk['to_col'])});"
+                f"REFERENCES {mssql_name(fk['to_table'])} ({mssql_name(fk['to_col'])})"
+                f"{actions};"
             )
     if any(tinfo["fk"] for tinfo in schema["tables"].values()):
         lines.append("")

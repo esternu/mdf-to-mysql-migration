@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from transform import convert_type, mssql_name, render_index_ddl
+from transform import convert_type, mssql_name, render_index_ddl, fk_actions_sql
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -105,24 +105,30 @@ def read_mysql_schema(conn, db_name: str) -> Dict[str, Any]:
             tbl["indexes"][iname] = {"unique": not bool(non_unique), "columns": []}
         tbl["indexes"][iname]["columns"].append(cname)
 
-    # ── Foreign Keys ──────────────────────────────────────────────────────
+    # ── Foreign Keys (inkl. ON DELETE/UPDATE-Regeln) ──────────────────────
     cur.execute("""
         SELECT kcu.TABLE_NAME, kcu.CONSTRAINT_NAME,
-               kcu.COLUMN_NAME, kcu.REFERENCED_TABLE_NAME, kcu.REFERENCED_COLUMN_NAME
+               kcu.COLUMN_NAME, kcu.REFERENCED_TABLE_NAME, kcu.REFERENCED_COLUMN_NAME,
+               rc.DELETE_RULE, rc.UPDATE_RULE
         FROM   INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
         JOIN   INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
                ON  tc.CONSTRAINT_NAME  = kcu.CONSTRAINT_NAME
                AND tc.TABLE_SCHEMA     = kcu.TABLE_SCHEMA
                AND tc.TABLE_NAME       = kcu.TABLE_NAME
+        LEFT JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
+               ON  rc.CONSTRAINT_NAME   = kcu.CONSTRAINT_NAME
+               AND rc.CONSTRAINT_SCHEMA = kcu.TABLE_SCHEMA
         WHERE  kcu.TABLE_SCHEMA = %s
           AND  tc.CONSTRAINT_TYPE = 'FOREIGN KEY'
     """, (db_name,))
-    for tname, fkname, col, ref_table, ref_col in cur.fetchall():
+    for tname, fkname, col, ref_table, ref_col, del_rule, upd_rule in cur.fetchall():
         if tname in schema["tables"]:
             schema["tables"][tname]["fks"][fkname] = {
-                "from_col": col,
-                "to_table": ref_table,
-                "to_col":   ref_col,
+                "from_col":  col,
+                "to_table":  ref_table,
+                "to_col":    ref_col,
+                "on_delete": del_rule or "RESTRICT",
+                "on_update": upd_rule or "RESTRICT",
             }
 
     cur.close()
@@ -161,6 +167,18 @@ def _source_mysql_type(col: dict) -> str:
     return _normalize_mysql_type(
         convert_type(col["type"], col.get("max_len"), col.get("precision"), col.get("scale"))
     )
+
+
+def _normalize_fk_action(action: Optional[str]) -> str:
+    """Normalisiert FK-Referenzaktionen für den Vergleich MSSQL ↔ MySQL.
+
+    SQL Server meldet 'NO_ACTION', MySQL 'RESTRICT' bzw. 'NO ACTION' –
+    alle drei verhalten sich in MySQL/InnoDB identisch.
+    """
+    a = (action or "NO_ACTION").upper().replace("_", " ")
+    if a in ("NO ACTION", "RESTRICT"):
+        return "RESTRICT"
+    return a
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -233,6 +251,7 @@ def diff_schemas(source: dict, target_mysql: dict) -> dict:
             "modified_columns": [],
             "new_indexes":      [],
             "new_fks":          [],
+            "modified_fks":     [],
         }
 
         src_cols = {c["name"].lower(): c for c in tinfo["columns"]}
@@ -277,7 +296,7 @@ def diff_schemas(source: dict, target_mysql: dict) -> dict:
             if iname_lower not in tgt_idx:
                 changes["new_indexes"].append(idx)
 
-        # Neue FKs
+        # Neue + geänderte FKs (ON DELETE/UPDATE-Regel weicht ab)
         src_fks = {
             re.sub(r'[^a-zA-Z0-9_]', '_', fk["name"]).lower(): fk
             for fk in tinfo.get("fk", [])
@@ -286,6 +305,19 @@ def diff_schemas(source: dict, target_mysql: dict) -> dict:
         for fkname_lower, fk in src_fks.items():
             if fkname_lower not in tgt_fks:
                 changes["new_fks"].append(fk)
+                continue
+            tgt_fk  = tgt_fks[fkname_lower]
+            src_del = _normalize_fk_action(fk.get("on_delete"))
+            src_upd = _normalize_fk_action(fk.get("on_update"))
+            tgt_del = _normalize_fk_action(tgt_fk.get("on_delete"))
+            tgt_upd = _normalize_fk_action(tgt_fk.get("on_update"))
+            if src_del != tgt_del or src_upd != tgt_upd:
+                changes["modified_fks"].append(fk)
+                diff["warnings"].append(
+                    f"{tbl_name}.{fk['name']}: FK-Regel weicht ab "
+                    f"(MySQL: ON DELETE {tgt_del}/ON UPDATE {tgt_upd} → "
+                    f"Soll: ON DELETE {src_del}/ON UPDATE {src_upd}) – wird korrigiert."
+                )
 
         if any(changes.values()):
             diff["altered_tables"][tbl_name] = changes
@@ -489,11 +521,36 @@ def generate_diff_ddl(
         # Neue Foreign Keys
         for fk in changes["new_fks"]:
             safe_fk = re.sub(r'[^a-zA-Z0-9_]', '_', fk["name"])
+            actions, fk_warns = fk_actions_sql(fk)
+            for w in fk_warns:
+                lines.append(f"-- ⚠ {w}")
             lines.append(
                 f"ALTER TABLE {mssql_name(tbl_name)} "
                 f"ADD CONSTRAINT `{safe_fk}` "
                 f"FOREIGN KEY ({mssql_name(fk['from_col'])}) "
-                f"REFERENCES {mssql_name(fk['to_table'])} ({mssql_name(fk['to_col'])});"
+                f"REFERENCES {mssql_name(fk['to_table'])} ({mssql_name(fk['to_col'])})"
+                f"{actions};"
+            )
+
+        # Geänderte FK-Regeln: DROP + ADD mit korrekter ON DELETE/UPDATE-Klausel
+        for fk in changes.get("modified_fks", []):
+            safe_fk = re.sub(r'[^a-zA-Z0-9_]', '_', fk["name"])
+            actions, fk_warns = fk_actions_sql(fk)
+            for w in fk_warns:
+                lines.append(f"-- ⚠ {w}")
+            lines.append(
+                f"-- FK-Regel korrigieren: {fk['name']}"
+                f" (ON DELETE {_normalize_fk_action(fk.get('on_delete'))})"
+            )
+            lines.append(
+                f"ALTER TABLE {mssql_name(tbl_name)} DROP FOREIGN KEY `{safe_fk}`;"
+            )
+            lines.append(
+                f"ALTER TABLE {mssql_name(tbl_name)} "
+                f"ADD CONSTRAINT `{safe_fk}` "
+                f"FOREIGN KEY ({mssql_name(fk['from_col'])}) "
+                f"REFERENCES {mssql_name(fk['to_table'])} ({mssql_name(fk['to_col'])})"
+                f"{actions};"
             )
 
     lines.append("")
@@ -581,6 +638,12 @@ def format_diff_summary(diff: dict) -> str:
             if changes["new_fks"]:
                 for fk in changes["new_fks"]:
                     lines.append(f"    + FK {fk['name']} ON {tname}")
+            if changes.get("modified_fks"):
+                for fk in changes["modified_fks"]:
+                    lines.append(
+                        f"    ~ FK {fk['name']} ON {tname}: "
+                        f"Regel → ON DELETE {_normalize_fk_action(fk.get('on_delete'))}  ⚠"
+                    )
 
     if diff["removed_tables"]:
         lines.append(f"  Entfernte Tabellen ({len(diff['removed_tables'])}) – nur Warnung:")

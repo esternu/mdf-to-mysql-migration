@@ -261,14 +261,28 @@ class TestReadSchema:
 
     def test_foreign_key_assigned(self, mocker):
         col = ("dbo", "Orders", "UserId", 1, "NO", "int", None, None, None, None, 0)
-        fk  = ("FK_Orders_Users", "dbo", "Orders", "UserId", "dbo", "Users", "Id")
+        fk  = ("FK_Orders_Users", "dbo", "Orders", "UserId", "dbo", "Users", "Id",
+               "NO_ACTION", "NO_ACTION")
         session = self._session(mocker, col_rows=[col], fk_rows=[fk])
         schema  = read_schema(session, lambda m: None)
         fks = schema["tables"]["dbo.Orders"]["fk"]
         assert len(fks) == 1
-        assert fks[0]["name"]     == "FK_Orders_Users"
-        assert fks[0]["from_col"] == "UserId"
-        assert fks[0]["to_table"] == "Users"
+        assert fks[0]["name"]      == "FK_Orders_Users"
+        assert fks[0]["from_col"]  == "UserId"
+        assert fks[0]["to_table"]  == "Users"
+        assert fks[0]["on_delete"] == "NO_ACTION"
+
+    def test_foreign_key_cascade_action_read(self, mocker):
+        # TODO 1.1: ON DELETE CASCADE muss aus sys.foreign_keys mitgelesen
+        # werden, sonst verliert das MySQL-DDL die Kaskadenregel.
+        col = ("dbo", "Orders", "UserId", 1, "NO", "int", None, None, None, None, 0)
+        fk  = ("FK_Orders_Users", "dbo", "Orders", "UserId", "dbo", "Users", "Id",
+               "CASCADE", "NO_ACTION")
+        session = self._session(mocker, col_rows=[col], fk_rows=[fk])
+        schema  = read_schema(session, lambda m: None)
+        fks = schema["tables"]["dbo.Orders"]["fk"]
+        assert fks[0]["on_delete"] == "CASCADE"
+        assert fks[0]["on_update"] == "NO_ACTION"
 
     def test_view_parsed(self, mocker):
         vrow = ("dbo", "MyView", "CREATE VIEW [dbo].[MyView] AS SELECT 1")

@@ -477,7 +477,8 @@ _FK_SCHEMA = {
             ],
             "pk": ["Id"],
             "fk": [{"name": "FK_Orders_Users", "from_col": "UserId",
-                    "to_schema": "dbo", "to_table": "Users", "to_col": "Id"}],
+                    "to_schema": "dbo", "to_table": "Users", "to_col": "Id",
+                    "on_delete": "CASCADE", "on_update": "NO_ACTION"}],
         },
     },
     "views": {},
@@ -591,6 +592,31 @@ class TestGenerateMysqlDdl:
         assert "FOREIGN KEY" in ddl
         assert "FK_Orders_Users" in ddl
         assert "REFERENCES `Users`" in ddl
+
+    def test_foreign_key_on_delete_cascade_emitted(self):
+        # TODO 1.1: Kaskadenregel aus der Quelle muss im MySQL-DDL landen.
+        ddl = generate_mysql_ddl(_FK_SCHEMA, "TestDB")
+        assert "REFERENCES `Users` (`Id`) ON DELETE CASCADE;" in ddl
+        # NO_ACTION (on_update) erzeugt keine Klausel
+        assert "ON UPDATE" not in ddl
+
+    def test_foreign_key_set_default_warns_and_omits(self):
+        import copy
+        schema = copy.deepcopy(_FK_SCHEMA)
+        schema["tables"]["dbo.Orders"]["fk"][0]["on_delete"] = "SET_DEFAULT"
+        ddl = generate_mysql_ddl(schema, "TestDB")
+        assert "SET_DEFAULT" in ddl and "-- ⚠" in ddl   # Warnkommentar vorhanden
+        # Die eigentliche ALTER-Zeile darf keine ON DELETE-Klausel bekommen
+        alter_line = next(l for l in ddl.splitlines()
+                          if "ADD CONSTRAINT `FK_Orders_Users`" in l)
+        assert "ON DELETE" not in alter_line
+
+    def test_foreign_key_set_null_emitted(self):
+        import copy
+        schema = copy.deepcopy(_FK_SCHEMA)
+        schema["tables"]["dbo.Orders"]["fk"][0]["on_delete"] = "SET_NULL"
+        ddl = generate_mysql_ddl(schema, "TestDB")
+        assert "ON DELETE SET NULL;" in ddl
 
     def test_view_included_after_tables(self):
         schema = dict(_MINIMAL_SCHEMA)
