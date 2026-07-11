@@ -311,8 +311,41 @@ def convert_view_sql(tsql: str) -> tuple:
     # WITH (NOLOCK) entfernen
     sql = re.sub(r'\bWITH\s*\(\s*NOLOCK\s*\)', '', sql, flags=re.IGNORECASE)
 
-    # TOP n entfernen
-    sql = re.sub(r'\bTOP\s+\d+\b', '', sql, flags=re.IGNORECASE)
+    # ── TOP n → LIMIT n ───────────────────────────────────────────────────
+    # Nur der eindeutige Fall wird uebersetzt: genau EIN "SELECT TOP n" im
+    # aeussersten SELECT (= erstes SELECT des Bodys) → LIMIT n am View-Ende.
+    # Alles andere (TOP in Subquery, mehrere TOPs, WITH TIES, PERCENT,
+    # TOP (ausdruck)) wird gewarnt statt still gestrichen - ersatzloses
+    # Entfernen aendert die Ergebnismenge!
+    top_matches = list(re.finditer(
+        r'\bTOP\s+(?:(\d+)\b|\(\s*[^)]*\s*\))(\s+PERCENT)?(\s+WITH\s+TIES)?',
+        sql, flags=re.IGNORECASE))
+    if top_matches:
+        first_select = re.search(r'\bSELECT\b', sql, flags=re.IGNORECASE)
+        m = top_matches[0]
+        simple = (
+            len(top_matches) == 1
+            and m.group(1) is not None            # TOP <zahl>, kein (expr)
+            and not m.group(2) and not m.group(3) # kein PERCENT / WITH TIES
+            and first_select is not None
+            # TOP folgt direkt auf das erste SELECT (aeusserste Ebene)
+            and sql[first_select.end():m.start()].strip() == ""
+        )
+        if simple:
+            limit_n = m.group(1)
+            sql = sql[:m.start()] + sql[m.end():]
+            sql = sql.rstrip().rstrip(';')
+            sql += f"\nLIMIT {limit_n}"
+            warnings.append(
+                f"TOP {limit_n} wurde zu LIMIT {limit_n} am View-Ende - "
+                f"Ergebnis pruefen (ORDER BY-Bezug!)"
+            )
+        else:
+            warnings.append(
+                "TOP-Klausel konnte nicht automatisch uebersetzt werden "
+                "(Subquery/mehrfach/PERCENT/WITH TIES/Ausdruck) - "
+                "manuell in LIMIT umbauen! TOP bleibt im SQL stehen."
+            )
 
     # ── T-SQL String-Konkatenation (+) → MySQL CONCAT() ───────────────────
     sql = _convert_string_concat(sql)
