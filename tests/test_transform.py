@@ -380,6 +380,42 @@ class TestConvertViewSql:
         assert "JOIN" in result
         assert "CROSS APPLY" not in result
 
+    # ── Warnungen fuer nicht uebersetzbare Konstrukte (TODO 2.1) ─────────
+    def test_dateadd_warns(self):
+        _, warns = convert_view_sql("SELECT DATEADD(day, 1, col) FROM t")
+        assert any("DATEADD" in w for w in warns)
+
+    def test_datediff_warns(self):
+        _, warns = convert_view_sql("SELECT DATEDIFF(day, a, b) FROM t")
+        assert any("DATEDIFF" in w for w in warns)
+
+    def test_full_outer_join_warns(self):
+        _, warns = convert_view_sql("SELECT * FROM a FULL OUTER JOIN b ON a.id=b.id")
+        assert any("FULL OUTER JOIN" in w for w in warns)
+
+    def test_pivot_warns(self):
+        _, warns = convert_view_sql("SELECT * FROM t PIVOT (SUM(x) FOR y IN ([a]))")
+        assert any("PIVOT" in w for w in warns)
+
+    def test_cte_version_hint(self):
+        _, warns = convert_view_sql(
+            "CREATE VIEW [dbo].[V] AS\nWITH Base AS (SELECT 1 AS n) SELECT * FROM Base")
+        assert any("CTE" in w for w in warns)
+
+    def test_clean_sql_produces_no_warnings(self):
+        _, warns = convert_view_sql("SELECT a, b FROM t WHERE a > 1")
+        assert warns == []
+
+    def test_warnings_land_in_generated_ddl(self):
+        schema = dict(_MINIMAL_SCHEMA)
+        schema = {**schema, "views": {
+            "dbo.V": {"name": "V", "schema": "dbo",
+                      "definition": "CREATE VIEW [dbo].[V] AS "
+                                    "SELECT DATEDIFF(day, a, b) AS d FROM t"}
+        }}
+        ddl = generate_mysql_ddl(schema, "TestDB")
+        assert "-- ⚠" in ddl and "DATEDIFF" in ddl
+
     # Rückgabe-Tuple
     def test_returns_tuple_of_sql_and_warnings(self):
         result = convert_view_sql("SELECT 1")
