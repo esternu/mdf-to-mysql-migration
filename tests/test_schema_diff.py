@@ -214,6 +214,57 @@ def test_no_changes_produces_minimal_ddl():
     assert warns == []
 
 
+# ── Tests: FK-Regeln (ON DELETE/UPDATE) ───────────────────────────────────────
+
+def _fk_src_table():
+    return _src_table("Orders", [_src_col("Id", "int"), _src_col("UserId", "int")],
+                      pk=["Id"],
+                      fk=[{"name": "FK_Orders_Users", "from_col": "UserId",
+                           "to_schema": "dbo", "to_table": "Users", "to_col": "Id",
+                           "on_delete": "CASCADE", "on_update": "NO_ACTION"}])
+
+
+def _fk_mysql_table(on_delete="RESTRICT"):
+    t = _mysql_table("orders", [_mysql_col("Id", "INT"), _mysql_col("UserId", "INT")])
+    t["fks"]["FK_Orders_Users"] = {
+        "from_col": "UserId", "to_table": "Users", "to_col": "Id",
+        "on_delete": on_delete, "on_update": "RESTRICT",
+    }
+    return t
+
+
+def test_fk_rule_mismatch_detected_and_fixed():
+    # TODO 1.1: Live-DB hat RESTRICT, Quelle will CASCADE -> DROP + ADD im Diff.
+    src  = {"tables": {"t1": _fk_src_table()}}
+    tgt  = {"tables": {"orders": _fk_mysql_table("RESTRICT")}}
+    diff = diff_schemas(src, tgt)
+    assert len(diff["altered_tables"]["Orders"]["modified_fks"]) == 1
+    assert any("FK-Regel weicht ab" in w for w in diff["warnings"])
+
+    ddl, _ = generate_diff_ddl(diff, src, "testdb")
+    assert "DROP FOREIGN KEY `FK_Orders_Users`" in ddl
+    assert "ON DELETE CASCADE;" in ddl
+
+
+def test_fk_rule_match_produces_no_change():
+    # NO_ACTION (MSSQL) und RESTRICT (MySQL) sind gleichwertig -> kein Diff.
+    src = {"tables": {"t1": _fk_src_table()}}
+    src["tables"]["t1"]["fk"][0]["on_delete"] = "NO_ACTION"
+    tgt  = {"tables": {"orders": _fk_mysql_table("RESTRICT")}}
+    diff = diff_schemas(src, tgt)
+    assert diff["altered_tables"] == {}
+
+
+def test_new_fk_in_diff_carries_cascade():
+    src = {"tables": {"t1": _fk_src_table()}}
+    tgt = {"tables": {"orders": _mysql_table("orders", [
+        _mysql_col("Id", "INT"), _mysql_col("UserId", "INT")])}}
+    diff = diff_schemas(src, tgt)
+    ddl, _ = generate_diff_ddl(diff, src, "testdb")
+    assert "ADD CONSTRAINT `FK_Orders_Users`" in ddl
+    assert "ON DELETE CASCADE;" in ddl
+
+
 # ── Tests: detect_rename_candidates ───────────────────────────────────────────
 
 def test_rename_candidate_detected_when_unambiguous():
