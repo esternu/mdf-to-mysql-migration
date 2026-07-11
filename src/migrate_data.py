@@ -92,44 +92,38 @@ def iter_table_data(
 ) -> Generator[Tuple[List[str], List[Row]], None, None]:
     """Liest Spalten und Zeilen einer Tabelle in Chunks.
 
+    Eine einzige SELECT-Abfrage wird per ``cursor.fetchmany()`` gestreamt.
+    OFFSET-basiertes Paging (frueher: ``ORDER BY (SELECT NULL) OFFSET …``)
+    ist absichtlich abgeschafft: SQL Server garantiert dabei keine stabile
+    Reihenfolge zwischen den Einzelabfragen, wodurch Zeilen still doppelt
+    oder gar nicht migriert werden konnten. Die Spaltennamen kommen aus
+    ``cursor.description`` (spart die INFORMATION_SCHEMA-Abfrage).
+
     Yields
     ------
     (columns, rows)
-        columns – Spaltennamen (nur beim ersten Yield gefüllt, danach gleich)
+        columns – Spaltennamen (bei jedem Yield identisch)
         rows    – Liste von bis zu chunk_size Tupeln
     """
     cur = session.cursor()
-
-    # Spaltennamen
-    cur.execute("""
-        SELECT COLUMN_NAME
-        FROM   INFORMATION_SCHEMA.COLUMNS
-        WHERE  TABLE_SCHEMA = ? AND TABLE_NAME = ?
-        ORDER  BY ORDINAL_POSITION
-    """, schema, table)
-    columns = [row[0] for row in cur.fetchall()]
-
-    if not columns:
-        return
-
-    # Daten offset-basiert lesen (SQL Server 2012+)
-    offset = 0
-    while True:
-        if stop_event and stop_event.is_set():
+    try:
+        cur.execute(f"SELECT * FROM [{schema}].[{table}]")
+        columns = [d[0] for d in (cur.description or [])]
+        if not columns:
             return
 
-        cur.execute(
-            f"SELECT * FROM [{schema}].[{table}]"
-            f" ORDER BY (SELECT NULL)"
-            f" OFFSET {offset} ROWS FETCH NEXT {chunk_size} ROWS ONLY"
-        )
-        rows = cur.fetchall()
-        if not rows:
-            return
-        yield columns, list(rows)
-        offset += len(rows)
-        if len(rows) < chunk_size:
-            return
+        while True:
+            if stop_event and stop_event.is_set():
+                return
+            rows = cur.fetchmany(chunk_size)
+            if not rows:
+                return
+            yield columns, list(rows)
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
 
 
 # ════════════════════════════════════════════════════════════════════════════

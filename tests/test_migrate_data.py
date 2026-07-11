@@ -30,11 +30,19 @@ def _noop(msg: str) -> None:
 
 
 class _MockCursor:
-    """Simpler Cursor-Stub der aufeinanderfolgende fetchall()-Ergebnisse liefert."""
+    """Cursor-Stub: fetchall()-Sequenzen + SELECT*-Streaming via fetchmany().
 
-    def __init__(self, fetchall_results=None, side_effect=None):
+    select_results: Liste von (col_names, rows) – jedes ``SELECT * FROM``
+    lädt den nächsten Eintrag (setzt ``description`` und den fetchmany-Puffer),
+    wie es iter_table_data() seit TODO 1.4 erwartet.
+    """
+
+    def __init__(self, fetchall_results=None, side_effect=None, select_results=None):
         self._results   = iter(fetchall_results or [[]])
         self._effect    = side_effect
+        self._selects   = list(select_results or [])
+        self._data      = []
+        self.description = None
         self.executed   = []
         self.many_calls = []
         self.closed     = False
@@ -43,6 +51,10 @@ class _MockCursor:
         if self._effect:
             raise self._effect
         self.executed.append((sql,) + args)
+        if sql.lstrip().upper().startswith("SELECT * FROM") and self._selects:
+            cols, rows = self._selects.pop(0)
+            self.description = [(c, None, None, None, None, None, None) for c in cols]
+            self._data       = list(rows)
 
     def executemany(self, sql, batch):
         if self._effect:
@@ -52,6 +64,10 @@ class _MockCursor:
     def fetchall(self):
         return list(next(self._results, []))
 
+    def fetchmany(self, n):
+        out, self._data = self._data[:n], self._data[n:]
+        return out
+
     def close(self):
         self.closed = True
 
@@ -59,8 +75,8 @@ class _MockCursor:
 class _MockSession:
     """Ersetzt MdfSession – liefert einen konfigurierbaren _MockCursor."""
 
-    def __init__(self, fetchall_results=None, side_effect=None):
-        self._cur = _MockCursor(fetchall_results, side_effect)
+    def __init__(self, fetchall_results=None, side_effect=None, select_results=None):
+        self._cur = _MockCursor(fetchall_results, side_effect, select_results)
 
     def cursor(self):
         return self._cur
@@ -89,15 +105,8 @@ class _MockMySQLConn:
 
 
 def _table_session(col_names, data_rows):
-    """Session-Mock für eine einzelne Tabelle.
-
-    Liefert die fetchall-Sequenz die iter_table_data erwartet:
-      1. Spaltennamen-Query
-      2. Daten-Chunk (alle Zeilen auf einmal, da chunk_size > len(data_rows))
-      3. Leere Liste → Generator stoppt
-    """
-    cols = [(c,) for c in col_names]
-    return _MockSession(fetchall_results=[cols, data_rows, []])
+    """Session-Mock für eine einzelne Tabelle (iter_table_data-Streaming)."""
+    return _MockSession(select_results=[(col_names, data_rows)])
 
 
 def _all_session(tables_data: dict):
@@ -105,18 +114,13 @@ def _all_session(tables_data: dict):
 
     tables_data: {table_name: (col_names, data_rows)}
 
-    Fetchall-Sequenz:
-      1. get_row_counts → [(schema, name, count), ...]
-      2. Pro Tabelle: Spalten, Daten
-         (kein [] Terminator nötig: Testdaten < CHUNK_SIZE=5000, Generator endet
-          früher via "if len(rows) < chunk_size: return")
+    Sequenz:
+      - fetchall #1: get_row_counts → [(schema, name, count), ...]
+      - pro Tabelle ein SELECT* (description + fetchmany-Daten)
     """
-    counts = [("dbo", name, len(rows)) for name, (_, rows) in tables_data.items()]
-    results = [counts]
-    for col_names, data_rows in tables_data.values():
-        results.append([(c,) for c in col_names])
-        results.append(data_rows)
-    return _MockSession(fetchall_results=results)
+    counts  = [("dbo", name, len(rows)) for name, (_, rows) in tables_data.items()]
+    selects = [(col_names, data_rows) for col_names, data_rows in tables_data.values()]
+    return _MockSession(fetchall_results=[counts], select_results=selects)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -177,12 +181,12 @@ class TestIterTableData:
         assert rows == [(1, "Bangle 1", "Silver"), (2, "Bangle 2", "Gold")]
 
     def test_empty_table_yields_nothing(self):
-        session = _MockSession(fetchall_results=[[("Id",)], []])
+        session = _table_session(["Id"], [])
         chunks  = list(iter_table_data(session, "dbo", "EmptyTable", chunk_size=100))
         assert chunks == []
 
     def test_no_columns_yields_nothing(self):
-        session = _MockSession(fetchall_results=[[]])
+        session = _table_session([], [])
         chunks  = list(iter_table_data(session, "dbo", "T", chunk_size=100))
         assert chunks == []
 
@@ -202,14 +206,8 @@ class TestIterTableData:
         assert chunks == []
 
     def test_multiple_chunks(self):
-        """Chunk-Grenze wird korrekt durch leeres fetchall signalisiert."""
-        # Zwei Chunks à 2 Zeilen + abschließendes leeres fetchall
-        session = _MockSession(fetchall_results=[
-            [("Id",)],
-            [(1,), (2,)],   # chunk 1
-            [(3,), (4,)],   # chunk 2
-            [],             # Ende
-        ])
+        """fetchmany(chunk_size) liefert die Daten in Haeppchen."""
+        session = _table_session(["Id"], [(1,), (2,), (3,), (4,)])
         chunks = list(iter_table_data(session, "dbo", "T", chunk_size=2))
         assert len(chunks) == 2
         assert chunks[0][1] == [(1,), (2,)]
@@ -228,13 +226,13 @@ class TestMigrateTable:
         assert count == 2
 
     def test_empty_table_returns_zero(self):
-        session = _MockSession(fetchall_results=[[("Id",)], []])
+        session = _table_session(["Id"], [])
         conn    = _MockMySQLConn()
         count   = migrate_table(conn, "T", session, "dbo", 0, _noop)
         assert count == 0
 
     def test_empty_table_skipped_message_logged(self):
-        session = _MockSession(fetchall_results=[[("Id",)], []])
+        session = _table_session(["Id"], [])
         conn    = _MockMySQLConn()
         logged  = []
         migrate_table(conn, "MyTable", session, "dbo", 0, logged.append)
@@ -382,12 +380,11 @@ class TestMigrateAll:
             def rollback(self): self.rolled_back += 1
             def close(self): pass
 
-        # Separate session with combined fetchall sequence
-        session = _MockSession(fetchall_results=[
-            [("dbo", "T1", 1), ("dbo", "T2", 1)],  # get_row_counts
-            [("Id",)], [(1,)],                       # T1 (kein [] Terminator nötig)
-            [("Id",)], [(2,)],                       # T2
-        ])
+        # Session: erst row_counts (fetchall), dann zwei SELECT*-Streams
+        session = _MockSession(
+            fetchall_results=[[("dbo", "T1", 1), ("dbo", "T2", 1)]],
+            select_results=[(["Id"], [(1,)]), (["Id"], [(2,)])],
+        )
         conn   = _MixedConn()
         result = migrate_all(session, conn, tables, _noop)
 
