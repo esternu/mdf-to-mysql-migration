@@ -189,6 +189,28 @@ class TestConvertDefault:
     def test_empty_string_returns_none(self):
         assert convert_default("('')") is None
 
+    # ── Robustheit (TODO 2.7) ────────────────────────────────────────────
+    def test_unicode_literal_prefix_stripped(self):
+        # (N'Standard') erzeugte vorher das kaputte Literal 'N'Standard''
+        assert convert_default("(N'Standard')") == "'Standard'"
+
+    def test_inner_parens_preserved(self):
+        # zeichenweises strip("()") frass die schliessende Klammer im Wert
+        assert convert_default("('Wert (intern)')") == "'Wert (intern)'"
+
+    def test_escaped_quote_in_literal(self):
+        assert convert_default("('it''s')") == "'it''s'"
+
+    def test_getdate_with_fsp_matching_column(self):
+        # Striktes MySQL 8: DATETIME(6)-Spalte braucht CURRENT_TIMESTAMP(6)
+        assert convert_default("(getdate())", "DATETIME(6)") == "CURRENT_TIMESTAMP(6)"
+
+    def test_getdate_plain_datetime_no_fsp(self):
+        assert convert_default("(getdate())", "DATETIME") == "CURRENT_TIMESTAMP"
+
+    def test_negative_number_default(self):
+        assert convert_default("((-1))") == "'-1'"
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  _convert_string_concat
