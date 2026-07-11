@@ -214,6 +214,31 @@ def test_no_changes_produces_minimal_ddl():
     assert warns == []
 
 
+def test_datetime_fsp_zero_equals_plain_datetime():
+    # TODO 2.6: datetime2(0) -> DATETIME; MySQL meldet "datetime" -> kein Diff.
+    src = {"tables": {"t1": _src_table("MyTable", [
+        _src_col("CreatedAt", "datetime2", scale=0),
+    ])}}
+    tgt = {"tables": {"mytable": _mysql_table("mytable", [
+        _mysql_col("CreatedAt", "DATETIME"),
+    ])}}
+    diff = diff_schemas(src, tgt)
+    assert diff["altered_tables"] == {}
+
+
+def test_datetime_fsp_mismatch_detected():
+    # Bestehende DATETIME(6)-Spalte vs. Quelle datetime2(0) -> Typkorrektur.
+    src = {"tables": {"t1": _src_table("MyTable", [
+        _src_col("CreatedAt", "datetime2", scale=0),
+    ])}}
+    tgt = {"tables": {"mytable": _mysql_table("mytable", [
+        _mysql_col("CreatedAt", "DATETIME(6)"),
+    ])}}
+    diff = diff_schemas(src, tgt)
+    mods = diff["altered_tables"]["MyTable"]["modified_columns"]
+    assert mods[0] == ("CreatedAt", "DATETIME(6)", "DATETIME")
+
+
 # ── Tests: FK-Regeln (ON DELETE/UPDATE) ───────────────────────────────────────
 
 def _fk_src_table():

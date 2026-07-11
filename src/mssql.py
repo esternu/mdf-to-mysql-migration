@@ -249,7 +249,9 @@ def read_schema(session: MdfSession, log) -> dict:
             c.DATA_TYPE,
             c.CHARACTER_MAXIMUM_LENGTH,
             c.NUMERIC_PRECISION,
-            c.NUMERIC_SCALE,
+            -- Fuer datetime2/time/datetimeoffset ist NUMERIC_SCALE NULL -
+            -- die Nachkommastellen (fsp) stehen in DATETIME_PRECISION.
+            COALESCE(c.NUMERIC_SCALE, c.DATETIME_PRECISION) AS NUMERIC_SCALE,
             c.COLUMN_DEFAULT,
             COLUMNPROPERTY(OBJECT_ID(t.TABLE_SCHEMA+'.'+t.TABLE_NAME),
                            c.COLUMN_NAME, 'IsIdentity') AS IS_IDENTITY

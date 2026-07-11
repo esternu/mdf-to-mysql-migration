@@ -159,6 +159,8 @@ def _normalize_mysql_type(t: str) -> str:
         lambda m: 'TINYINT(1)' if m.group(1) == '1' else 'TINYINT',
         t,
     )
+    # fsp 0 ist implizit: MySQL meldet DATETIME(0)/TIME(0) als datetime/time
+    t = re.sub(r'\b(DATETIME|TIME|TIMESTAMP)\(0\)', r'\1', t)
     return t
 
 
