@@ -153,6 +153,102 @@ def _convert_string_concat(sql: str) -> str:
     return _STR_CONCAT_CHAIN.sub(_replace, sql)
 
 
+# CAST-Zieltypen: T-SQL-Typname → gueltiger MySQL-CAST-Typ.
+# (nvarchar/money etc. sind zu diesem Zeitpunkt bereits durch die
+# _VIEW_TYPE_MAP-Ersetzungen in CHAR/DECIMAL(19,4) umgeschrieben.)
+_CAST_TYPE_MAP = {
+    "INT": "SIGNED", "BIGINT": "SIGNED", "SMALLINT": "SIGNED",
+    "TINYINT": "UNSIGNED", "BIT": "UNSIGNED",
+    "FLOAT": "DOUBLE", "REAL": "FLOAT", "DOUBLE": "DOUBLE",
+    "DECIMAL": "DECIMAL", "NUMERIC": "DECIMAL",
+    "VARCHAR": "CHAR", "NVARCHAR": "CHAR", "CHAR": "CHAR", "NCHAR": "CHAR",
+    "DATETIME": "DATETIME", "DATETIME2": "DATETIME", "SMALLDATETIME": "DATETIME",
+    "DATE": "DATE", "TIME": "TIME",
+}
+
+# CAST-Typen, die keine Laengenangabe erlauben/brauchen
+_CAST_NO_LENGTH = {"SIGNED", "UNSIGNED", "DOUBLE", "FLOAT", "DATE", "DATETIME", "TIME"}
+
+
+def _split_top_level_commas(s: str) -> List[str]:
+    """Teilt einen Argument-String an Kommas der obersten Klammerebene.
+    Kommas in Klammern und String-Literalen werden ignoriert."""
+    parts: List[str] = []
+    buf:   List[str] = []
+    depth  = 0
+    in_str = False
+    for ch in s:
+        if in_str:
+            buf.append(ch)
+            if ch == "'":
+                in_str = False
+            continue
+        if ch == "'":
+            in_str = True
+            buf.append(ch)
+            continue
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        if ch == ',' and depth == 0:
+            parts.append(''.join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    parts.append(''.join(buf))
+    return parts
+
+
+def _convert_tsql_convert(sql: str, warnings: List[str]) -> str:
+    """T-SQL ``CONVERT(typ, ausdruck)`` → MySQL ``CAST(ausdruck AS typ)``.
+
+    Die Argument-Reihenfolge ist zwischen T-SQL (typ zuerst) und MySQL
+    (ausdruck zuerst) vertauscht - unuebersetzt entsteht gueltig
+    aussehendes, aber falsches SQL. Die 3-Argument-Form (Style-Nummer,
+    z.B. CONVERT(VARCHAR, datum, 104)) ist Datums-/Zahlformatierung und
+    muss manuell zu DATE_FORMAT() werden → Warnung, bleibt stehen.
+    """
+    pattern = re.compile(r'\bCONVERT\s*\(', re.IGNORECASE)
+    result: List[str] = []
+    i = 0
+    while True:
+        m = pattern.search(sql, i)
+        if not m:
+            result.append(sql[i:])
+            break
+        open_pos  = m.end() - 1
+        close_pos = _paren_close(sql, open_pos)
+        args      = [a.strip() for a in _split_top_level_commas(sql[m.end():close_pos])]
+        result.append(sql[i:m.start()])
+
+        converted = False
+        if len(args) == 2:
+            tm = re.match(r'([A-Za-z_]\w*)\s*(\(\s*\d+(?:\s*,\s*\d+)?\s*\))?$', args[0])
+            mapped = _CAST_TYPE_MAP.get(tm.group(1).upper()) if tm else None
+            if mapped:
+                length = "" if mapped in _CAST_NO_LENGTH else (tm.group(2) or "")
+                expr   = _convert_tsql_convert(args[1], warnings)   # geschachtelte CONVERTs
+                result.append(f"CAST({expr} AS {mapped}{length})")
+                converted = True
+            else:
+                warnings.append(
+                    f"CONVERT() mit nicht abbildbarem Zieltyp '{args[0]}' - manuell pruefen"
+                )
+        elif len(args) == 3:
+            warnings.append(
+                "CONVERT() mit Style-Argument (Datums-/Zahlformat) - "
+                "manuell zu DATE_FORMAT() umbauen, bleibt unuebersetzt im SQL"
+            )
+        else:
+            warnings.append("CONVERT() konnte nicht geparst werden - manuell pruefen")
+
+        if not converted:
+            result.append(sql[m.start():close_pos + 1])
+        i = close_pos + 1
+    return ''.join(result)
+
+
 def _paren_close(sql: str, open_pos: int) -> int:
     """Gibt den Index der schliessenden ')' zurück, die zu '(' an open_pos gehört."""
     depth = 1
@@ -307,6 +403,9 @@ def convert_view_sql(tsql: str) -> tuple:
     sql = re.sub(r'\bCHARINDEX\s*\(([^,]+),([^)]+)\)',
                  r'LOCATE(\1,\2)', sql, flags=re.IGNORECASE)
     sql = re.sub(r'\bSUBSTRING\s*\(',       'SUBSTRING(',      sql, flags=re.IGNORECASE)
+
+    # T-SQL CONVERT(typ, expr) → CAST(expr AS typ)  (vertauschte Argumente!)
+    sql = _convert_tsql_convert(sql, warnings)
 
     # WITH (NOLOCK) entfernen
     sql = re.sub(r'\bWITH\s*\(\s*NOLOCK\s*\)', '', sql, flags=re.IGNORECASE)

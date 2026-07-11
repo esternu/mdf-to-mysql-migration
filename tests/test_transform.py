@@ -404,6 +404,36 @@ class TestConvertViewSql:
         assert "JOIN" in result
         assert "CROSS APPLY" not in result
 
+    # ── CONVERT() → CAST() (TODO 2.3) ────────────────────────────────────
+    def test_convert_two_args_becomes_cast(self):
+        result, warns = convert_view_sql("SELECT CONVERT(INT, col) FROM t")
+        assert "CAST(col AS SIGNED)" in result
+        assert "CONVERT" not in result
+        assert warns == []
+
+    def test_convert_nvarchar_with_length(self):
+        # nvarchar wird vorher durch die Typ-Map zu CHAR - Laenge bleibt
+        result, _ = convert_view_sql("SELECT CONVERT(NVARCHAR(10), col) FROM t")
+        assert "CAST(col AS CHAR(10))" in result
+
+    def test_convert_decimal_keeps_precision(self):
+        result, _ = convert_view_sql("SELECT CONVERT(DECIMAL(18,2), col) FROM t")
+        assert "CAST(col AS DECIMAL(18,2))" in result
+
+    def test_convert_nested_expression(self):
+        result, _ = convert_view_sql("SELECT CONVERT(INT, ROUND(a / b, 0)) FROM t")
+        assert "CAST(ROUND(a / b, 0) AS SIGNED)" in result
+
+    def test_convert_with_style_warns_and_keeps(self):
+        # 3-Argument-Form = Datumsformatierung, nicht automatisch uebersetzbar
+        result, warns = convert_view_sql("SELECT CONVERT(CHAR(10), col, 104) FROM t")
+        assert "CONVERT" in result                 # bleibt stehen
+        assert any("Style" in w for w in warns)
+
+    def test_convert_unknown_type_warns(self):
+        result, warns = convert_view_sql("SELECT CONVERT(GEOGRAPHY, col) FROM t")
+        assert any("nicht abbildbarem Zieltyp" in w for w in warns)
+
     # ── Warnungen fuer nicht uebersetzbare Konstrukte (TODO 2.1) ─────────
     def test_dateadd_warns(self):
         _, warns = convert_view_sql("SELECT DATEADD(day, 1, col) FROM t")
