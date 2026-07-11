@@ -464,6 +464,29 @@ class TestConvertViewSql:
         assert "JOIN" in result
         assert "CROSS APPLY" not in result
 
+    # ── APPLY-Fallback mit ON 1=1 (TODO 2.8) ─────────────────────────────
+    def test_apply_fallback_has_on_clause(self):
+        # Body ohne erkennbare WHERE-Korrelation -> Fallback; LEFT JOIN
+        # ohne ON waere ein MySQL-Syntaxfehler.
+        sql = "SELECT * FROM a OUTER APPLY (SELECT 1 AS x) AS s"
+        result, warns = convert_view_sql(sql)
+        assert "LEFT JOIN" in result
+        assert "ON 1=1" in result
+        assert any("manuell pruefen" in w for w in warns)
+
+    def test_cross_apply_fallback_has_on_clause(self):
+        sql = "SELECT * FROM a CROSS APPLY (SELECT 1 AS x) AS s"
+        result, warns = convert_view_sql(sql)
+        assert "ON 1=1" in result
+        assert any("APPLY" in w for w in warns)
+
+    def test_recognized_apply_correlation_no_fallback_warning(self):
+        sql = ("SELECT * FROM a OUTER APPLY ("
+               "SELECT SUM(x) AS sx FROM detail d WHERE d.aid = a.id) AS s")
+        result, warns = convert_view_sql(sql)
+        assert "ON 1=1" not in result
+        assert not any("ON 1=1" in w for w in warns)
+
     # ── Verbleibende '+'-Konkatenation warnt (TODO 2.4) ──────────────────
     def test_unconverted_string_concat_warns(self):
         # 2 Klammer-Ebenen im CAST -> _convert_string_concat greift nicht

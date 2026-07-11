@@ -318,14 +318,18 @@ def _paren_close(sql: str, open_pos: int) -> int:
     return i - 1
 
 
-def _convert_apply_to_join(sql: str) -> str:
+def _convert_apply_to_join(sql: str, warnings: Optional[List[str]] = None) -> str:
     """Konvertiert OUTER/CROSS APPLY zu LEFT JOIN / JOIN mit gruppierter Subquery.
 
     OUTER APPLY → LEFT JOIN (subquery + GROUP BY) ON join_condition
     CROSS APPLY → JOIN      (subquery + GROUP BY) ON join_condition
 
     Vermeidet LATERAL, das auf manchen MariaDB-Builds nicht verfügbar ist.
+    Wird die Korrelation nicht erkannt, entsteht ein Fallback-JOIN mit
+    ``ON 1=1`` + Warnung (LEFT JOIN ohne ON waere ein Syntaxfehler).
     """
+    if warnings is None:
+        warnings = []
     apply_re = re.compile(r'\b(OUTER|CROSS)\s+APPLY\s*\(', re.IGNORECASE)
     result: List[str] = []
     pos = 0
@@ -389,8 +393,15 @@ def _convert_apply_to_join(sql: str) -> str:
                 pos = alias_end
                 continue
 
-        # Fallback: Body unverändert übernehmen
-        result.append(f'{join_kw} ({body}) AS {alias}')
+        # Fallback: Korrelation nicht erkannt - ON 1=1 haelt das SQL gueltig
+        # (LEFT JOIN ohne ON ist in MySQL ein Syntaxfehler), Semantik des
+        # urspruenglichen APPLY muss aber manuell geprueft werden.
+        warnings.append(
+            f"{m.group(1).upper()} APPLY konnte nicht vollstaendig konvertiert "
+            f"werden (Korrelationsbedingung nicht erkannt) - Fallback-JOIN mit "
+            f"ON 1=1, Semantik manuell pruefen!"
+        )
+        result.append(f'{join_kw} ({body}) AS {alias} ON 1=1')
         pos = alias_end
 
     result.append(sql[pos:])
@@ -544,7 +555,7 @@ def convert_view_sql(tsql: str) -> tuple:
     )
 
     # ── OUTER/CROSS APPLY → LEFT JOIN / JOIN (grouped subquery) ──────────
-    sql = _convert_apply_to_join(sql)
+    sql = _convert_apply_to_join(sql, warnings)
 
     # ── Erkennungs-Pass: bekannte, NICHT automatisch übersetzbare Konstrukte ─
     # Diese Funktionen/Klauseln haben in MySQL keine 1:1-Entsprechung oder
