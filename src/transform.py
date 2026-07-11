@@ -70,6 +70,15 @@ def convert_type(sql_type: str, max_len, precision, scale) -> str:
             return "TEXT" if ml <= 65535 else "MEDIUMTEXT"
         return f"VARCHAR({ml})"
 
+    # datetime2(s)/datetimeoffset(s)/time(s): Praezision (fsp) uebernehmen.
+    # SQL Server erlaubt 0-7, MySQL 0-6 → Cap bei 6. Ohne Angabe (None)
+    # bleibt der bisherige sichere Default 6. fsp 0 → Typ ohne Klammer
+    # (MySQL meldet DATETIME(0) als "datetime" zurueck).
+    if base in ("datetime2", "datetimeoffset", "time"):
+        fsp    = min(int(scale), 6) if scale is not None else 6
+        target = "TIME" if base == "time" else "DATETIME"
+        return f"{target}({fsp})" if fsp > 0 else target
+
     # binary(n)/varbinary(n): Laenge uebernehmen, sonst legt MySQL BINARY(1)
     # an und trunkiert Daten. varbinary(max) (= max_len -1) bleibt LONGBLOB.
     if base in ("binary", "varbinary") and max_len is not None:

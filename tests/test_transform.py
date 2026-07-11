@@ -86,6 +86,27 @@ class TestConvertType:
     def test_datetime2(self):
         assert convert_type("datetime2", None, None, None) == "DATETIME(6)"
 
+    # ── datetime2/time-Praezision (TODO 2.6) ─────────────────────────────
+    def test_datetime2_scale_zero(self):
+        # datetime2(0) (Cockpit-Standard) -> DATETIME ohne fsp, nicht (6)
+        assert convert_type("datetime2", None, None, 0) == "DATETIME"
+
+    def test_datetime2_scale_preserved(self):
+        assert convert_type("datetime2", None, None, 3) == "DATETIME(3)"
+
+    def test_datetime2_scale_capped_at_6(self):
+        # SQL Server erlaubt 7, MySQL max. 6
+        assert convert_type("datetime2", None, None, 7) == "DATETIME(6)"
+
+    def test_time_scale_preserved(self):
+        assert convert_type("time", None, None, 3) == "TIME(3)"
+
+    def test_time_scale_zero(self):
+        assert convert_type("time", None, None, 0) == "TIME"
+
+    def test_datetimeoffset_scale(self):
+        assert convert_type("datetimeoffset", None, None, 2) == "DATETIME(2)"
+
     def test_date(self):
         assert convert_type("date", None, None, None) == "DATE"
 
