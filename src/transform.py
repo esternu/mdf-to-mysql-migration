@@ -300,7 +300,10 @@ def convert_view_sql(tsql: str) -> tuple:
     sql = re.sub(r'\bGETUTCDATE\s*\(\s*\)', 'UTC_TIMESTAMP()', sql, flags=re.IGNORECASE)
     sql = re.sub(r'\bISNULL\s*\(',           'IFNULL(',         sql, flags=re.IGNORECASE)
     sql = re.sub(r'\bIIF\s*\(',              'IF(',             sql, flags=re.IGNORECASE)
-    sql = re.sub(r'\bLEN\s*\(',              'LENGTH(',         sql, flags=re.IGNORECASE)
+    # LEN() zaehlt in T-SQL ZEICHEN - MySQL LENGTH() zaehlt Bytes (utf8mb4:
+    # Umlaute = 2 Bytes!). CHAR_LENGTH() ist die korrekte Entsprechung.
+    # Verbleibende Abweichung: T-SQL LEN ignoriert nachgestellte Leerzeichen.
+    sql = re.sub(r'\bLEN\s*\(',              'CHAR_LENGTH(',    sql, flags=re.IGNORECASE)
     sql = re.sub(r'\bCHARINDEX\s*\(([^,]+),([^)]+)\)',
                  r'LOCATE(\1,\2)', sql, flags=re.IGNORECASE)
     sql = re.sub(r'\bSUBSTRING\s*\(',       'SUBSTRING(',      sql, flags=re.IGNORECASE)

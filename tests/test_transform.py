@@ -4,6 +4,7 @@ Deckt ab: Typkonvertierung, Bezeichner-Mapping, Default-Konvertierung,
            View-SQL-Konvertierung, topologischer Sort und DDL-Generierung.
 Keine externen Abhängigkeiten – keine Mocks erforderlich.
 """
+import re
 import pytest
 from transform import (
     convert_type,
@@ -314,10 +315,17 @@ class TestConvertViewSql:
         result, _ = convert_view_sql("SELECT IIF(a > 0, 'yes', 'no')")
         assert result.startswith("SELECT IF(")
 
-    def test_len_to_length(self):
+    def test_len_to_char_length(self):
+        # TODO 1.3: LEN() zaehlt Zeichen -> CHAR_LENGTH(), nicht LENGTH()
+        # (LENGTH zaehlt Bytes; utf8mb4-Umlaute waeren doppelt gezaehlt).
         result, _ = convert_view_sql("SELECT LEN(col)")
-        assert "LENGTH(" in result
-        assert "LEN(" not in result
+        assert "CHAR_LENGTH(col)" in result
+        assert not re.search(r"(?<!CHAR_)LENGTH\(", result)
+
+    def test_char_length_not_double_converted(self):
+        # Bereits korrektes CHAR_LENGTH darf nicht angefasst werden.
+        result, _ = convert_view_sql("SELECT CHAR_LENGTH(col)")
+        assert result.count("CHAR_LENGTH(") == 1
 
     # Entfernte Konstrukte
     def test_nolock_removed(self):
