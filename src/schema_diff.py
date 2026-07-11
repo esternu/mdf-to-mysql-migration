@@ -462,7 +462,7 @@ def generate_diff_ddl(
             mysql_type = convert_type(c["type"], c["max_len"], c["precision"], c["scale"])
             null_str   = "" if c["nullable"] else " NOT NULL"
             auto_str   = " AUTO_INCREMENT" if c["identity"] else ""
-            default    = convert_default(c["default"]) if not c["identity"] else None
+            default    = convert_default(c["default"], mysql_type) if not c["identity"] else None
             def_str    = f" DEFAULT {default}" if default else ""
             col_defs.append(
                 f"  {mssql_name(c['name'])} {mysql_type}{null_str}{auto_str}{def_str}"
@@ -484,7 +484,7 @@ def generate_diff_ddl(
             mysql_type = convert_type(col["type"], col["max_len"], col["precision"], col["scale"])
             null_str   = "" if col["nullable"] else " NOT NULL"
             auto_str   = " AUTO_INCREMENT" if col["identity"] else ""
-            default    = convert_default(col["default"]) if not col["identity"] else None
+            default    = convert_default(col["default"], mysql_type) if not col["identity"] else None
             def_str    = f" DEFAULT {default}" if default else ""
             lines.append(
                 f"ALTER TABLE {mssql_name(tbl_name)} "

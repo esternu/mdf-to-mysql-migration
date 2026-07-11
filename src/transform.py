@@ -100,27 +100,64 @@ def mssql_name(name: str) -> str:
     return f"`{name.strip('[]')}`"
 
 
-def convert_default(default_val: Optional[str]) -> Optional[str]:
+def _strip_balanced_parens(s: str) -> str:
+    """Entfernt aeussere Klammerpaare nur, wenn sie balanciert das GANZE
+    Argument umschliessen. '(N''Wert (intern)'')' verliert so nie die
+    innere schliessende Klammer (zeichenweises strip('()') tat das)."""
+    s = s.strip()
+    while s.startswith("(") and s.endswith(")"):
+        depth = 0
+        balanced = True
+        for i, ch in enumerate(s):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and i < len(s) - 1:
+                    balanced = False   # aeussere Klammer schliesst zu frueh
+                    break
+        if not balanced or depth != 0:
+            break
+        s = s[1:-1].strip()
+    return s
+
+
+def convert_default(default_val: Optional[str], mysql_type: Optional[str] = None) -> Optional[str]:
     """Konvertiert einen SQL-Server-DEFAULT-Ausdruck in MySQL-Syntax.
 
-    SQL Server speichert Defaults als '(expr)' oder '((expr))'.
-    strip("()") entfernt alle führenden/abschliessenden Klammern zeichenweise,
-    sodass '(getdate())' → 'getdate' wird (nicht 'getdate()').
+    SQL Server speichert Defaults als '(expr)' oder '((expr))' – die
+    aeusseren Klammern werden balanciert entfernt (Klammern IM Wert
+    bleiben erhalten). ``N'…'``-Unicode-Literale verlieren ihr Praefix.
+
+    ``mysql_type`` (optional): Zieltyp der Spalte. Bei GETDATE()-Defaults
+    auf DATETIME(n)-Spalten wird CURRENT_TIMESTAMP(n) erzeugt – striktes
+    MySQL 8 verlangt uebereinstimmende fsp (MariaDB toleriert beides).
     """
     if default_val is None:
         return None
-    d     = default_val.strip().strip("()")
-    lower = d.lower()
-    # Nach strip("()") sind Klammern bereits entfernt
+    d = _strip_balanced_parens(default_val)
+    # getdate() / getutcdate(): Klammern des Funktionsaufrufs entfernen
+    func = re.fullmatch(r'(getdate|getutcdate|newid)\s*\(\s*\)', d, flags=re.IGNORECASE)
+    lower = func.group(1).lower() if func else d.lower()
+
     if lower in ("getdate", "getutcdate"):
-        return "CURRENT_TIMESTAMP"
+        m = re.fullmatch(r'DATETIME\((\d)\)', (mysql_type or "").strip(), flags=re.IGNORECASE)
+        return f"CURRENT_TIMESTAMP({m.group(1)})" if m else "CURRENT_TIMESTAMP"
     if lower == "newid":
         return None   # UUID() als DEFAULT nur ab MySQL 8.x
     if lower == "1":
         return "'1'"
     if lower == "0":
         return "'0'"
-    d = d.strip("'\"")
+
+    # N'…' → '…' (MySQL braucht das Unicode-Praefix nicht; im DEFAULT
+    # wuerde der strip unten sonst ein kaputtes Literal erzeugen)
+    m = re.fullmatch(r"N\s*'(.*)'", d, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        d = m.group(1)
+    else:
+        d = d.strip("'\"")
+    d = d.replace("''", "'").replace("'", "''")   # Escaping normalisieren
     return f"'{d}'" if d else None
 
 
@@ -720,7 +757,7 @@ def generate_mysql_ddl(schema: dict, target_db: str) -> str:
             mysql_type = convert_type(c["type"], c["max_len"], c["precision"], c["scale"])
             null_str   = "" if c["nullable"] else " NOT NULL"
             auto_str   = " AUTO_INCREMENT" if c["identity"] else ""
-            default    = convert_default(c["default"]) if not c["identity"] else None
+            default    = convert_default(c["default"], mysql_type) if not c["identity"] else None
             def_str    = f" DEFAULT {default}" if default else ""
             col_defs.append(
                 f"  {mssql_name(c['name'])} {mysql_type}{null_str}{auto_str}{def_str}"
