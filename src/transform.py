@@ -70,6 +70,16 @@ def convert_type(sql_type: str, max_len, precision, scale) -> str:
             return "TEXT" if ml <= 65535 else "MEDIUMTEXT"
         return f"VARCHAR({ml})"
 
+    # binary(n)/varbinary(n): Laenge uebernehmen, sonst legt MySQL BINARY(1)
+    # an und trunkiert Daten. varbinary(max) (= max_len -1) bleibt LONGBLOB.
+    if base in ("binary", "varbinary") and max_len is not None:
+        ml = int(max_len)
+        if ml == -1:
+            return "LONGBLOB"
+        if base == "binary":
+            return f"BINARY({min(ml, 255)})"
+        return f"VARBINARY({ml})" if ml <= 65532 else "LONGBLOB"
+
     if mysql == "DECIMAL" and precision:
         sc = scale or 0
         return f"DECIMAL({precision},{sc})"
