@@ -348,6 +348,32 @@ def convert_view_sql(tsql: str) -> tuple:
     # ── OUTER/CROSS APPLY → LEFT JOIN / JOIN (grouped subquery) ──────────
     sql = _convert_apply_to_join(sql)
 
+    # ── Erkennungs-Pass: bekannte, NICHT automatisch übersetzbare Konstrukte ─
+    # Diese Funktionen/Klauseln haben in MySQL keine 1:1-Entsprechung oder
+    # eine abweichende Argument-Semantik. Sie bleiben unverändert im SQL
+    # stehen und werden als Warnung geflaggt (landet als -- ⚠ Kommentar im
+    # DDL), statt still durchzulaufen und erst beim Deploy zu knallen.
+    _UNSUPPORTED = [
+        (r'\bDATEADD\s*\(',      "DATEADD() – MySQL: DATE_ADD(datum, INTERVAL n einheit); manuell umbauen"),
+        (r'\bDATEDIFF\s*\(',     "DATEDIFF() – Argument-Semantik weicht ab (T-SQL: einheit,von,bis / MySQL: bis,von in Tagen); manuell umbauen"),
+        (r'\bDATEPART\s*\(',     "DATEPART() – MySQL: EXTRACT(einheit FROM datum); manuell umbauen"),
+        (r'\bDATENAME\s*\(',     "DATENAME() – MySQL: DATE_FORMAT()/MONTHNAME(); manuell umbauen"),
+        (r'\bFORMAT\s*\(',       "FORMAT() – T-SQL-.NET-Formatstrings; MySQL: DATE_FORMAT()/FORMAT(zahl,stellen); manuell pruefen"),
+        (r'\bFULL\s+OUTER\s+JOIN\b', "FULL OUTER JOIN – von MySQL nicht unterstuetzt; per LEFT JOIN UNION RIGHT JOIN nachbauen"),
+        (r'\bPIVOT\s*\(',        "PIVOT – von MySQL nicht unterstuetzt; per CASE WHEN + GROUP BY nachbauen"),
+        (r'\bUNPIVOT\s*\(',      "UNPIVOT – von MySQL nicht unterstuetzt; per UNION ALL nachbauen"),
+        (r'\bOPENJSON\s*\(',     "OPENJSON() – MySQL: JSON_TABLE() (ab 8.0/MariaDB 10.6); manuell umbauen"),
+        (r'\bSTUFF\s*\(',        "STUFF() – MySQL: INSERT(str,pos,len,neu); manuell umbauen"),
+        (r'\bPATINDEX\s*\(',     "PATINDEX() – MySQL: REGEXP_INSTR(); manuell umbauen"),
+    ]
+    for pattern, hint in _UNSUPPORTED:
+        if re.search(pattern, sql, flags=re.IGNORECASE):
+            warnings.append(f"Nicht automatisch uebersetzbar: {hint}")
+
+    # CTE-Hinweis (WITH … AS (…)): erst ab MySQL 8.0 / MariaDB 10.2 verfuegbar
+    if re.search(r'(?:^|\n)\s*WITH\b.*?\bAS\s*\(', sql, flags=re.IGNORECASE | re.DOTALL):
+        warnings.append("CTE (WITH … AS) verwendet – erfordert MySQL >= 8.0 / MariaDB >= 10.2")
+
     # Doppelte Leerzeilen bereinigen
     sql = re.sub(r'\n{3,}', '\n\n', sql)
 
