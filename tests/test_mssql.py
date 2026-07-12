@@ -268,9 +268,26 @@ class TestReadSchema:
         fks = schema["tables"]["dbo.Orders"]["fk"]
         assert len(fks) == 1
         assert fks[0]["name"]      == "FK_Orders_Users"
-        assert fks[0]["from_col"]  == "UserId"
+        assert fks[0]["from_cols"] == ["UserId"]
         assert fks[0]["to_table"]  == "Users"
         assert fks[0]["on_delete"] == "NO_ACTION"
+
+    def test_composite_foreign_key_grouped(self, mocker):
+        # TODO 2.9: mehrspaltiger FK darf nur EINEN Eintrag ergeben,
+        # sonst entstehen zwei ADD CONSTRAINT mit gleichem Namen.
+        col = ("dbo", "Child", "PA", 1, "NO", "int", None, None, None, None, 0)
+        fk_rows = [
+            ("FK_Child_Parent", "dbo", "Child", "PA", "dbo", "Parent", "A",
+             "CASCADE", "NO_ACTION"),
+            ("FK_Child_Parent", "dbo", "Child", "PB", "dbo", "Parent", "B",
+             "CASCADE", "NO_ACTION"),
+        ]
+        session = self._session(mocker, col_rows=[col], fk_rows=fk_rows)
+        schema  = read_schema(session, lambda m: None)
+        fks = schema["tables"]["dbo.Child"]["fk"]
+        assert len(fks) == 1
+        assert fks[0]["from_cols"] == ["PA", "PB"]
+        assert fks[0]["to_cols"]   == ["A", "B"]
 
     def test_foreign_key_cascade_action_read(self, mocker):
         # TODO 1.1: ON DELETE CASCADE muss aus sys.foreign_keys mitgelesen

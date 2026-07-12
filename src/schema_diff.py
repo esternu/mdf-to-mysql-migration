@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from transform import convert_type, mssql_name, render_index_ddl, fk_actions_sql
+from transform import convert_type, mssql_name, render_index_ddl, fk_actions_sql, fk_col_list
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -33,7 +33,7 @@ def read_mysql_schema(conn, db_name: str) -> Dict[str, Any]:
               "columns":  {col_name: {"type": str, "nullable": bool, ...}},
               "pk":       [col_name, ...],
               "indexes":  {index_name: {"unique": bool, "columns": [col, ...]}},
-              "fks":      {fk_name: {"from_col": str, "to_table": str, "to_col": str}},
+              "fks":      {fk_name: {"from_cols": [str], "to_table": str, "to_cols": [str]}},
           }
         }
     """
@@ -122,14 +122,19 @@ def read_mysql_schema(conn, db_name: str) -> Dict[str, Any]:
           AND  tc.CONSTRAINT_TYPE = 'FOREIGN KEY'
     """, (db_name,))
     for tname, fkname, col, ref_table, ref_col, del_rule, upd_rule in cur.fetchall():
-        if tname in schema["tables"]:
-            schema["tables"][tname]["fks"][fkname] = {
-                "from_col":  col,
+        if tname not in schema["tables"]:
+            continue
+        # Composite-FKs: eine Zeile pro Spalte → pro Constraint gruppieren
+        fks = schema["tables"][tname]["fks"]
+        if fkname not in fks:
+            fks[fkname] = {
+                "from_cols": [], "to_cols": [],
                 "to_table":  ref_table,
-                "to_col":    ref_col,
                 "on_delete": del_rule or "RESTRICT",
                 "on_update": upd_rule or "RESTRICT",
             }
+        fks[fkname]["from_cols"].append(col)
+        fks[fkname]["to_cols"].append(ref_col)
 
     cur.close()
     return schema
@@ -529,8 +534,8 @@ def generate_diff_ddl(
             lines.append(
                 f"ALTER TABLE {mssql_name(tbl_name)} "
                 f"ADD CONSTRAINT `{safe_fk}` "
-                f"FOREIGN KEY ({mssql_name(fk['from_col'])}) "
-                f"REFERENCES {mssql_name(fk['to_table'])} ({mssql_name(fk['to_col'])})"
+                f"FOREIGN KEY ({fk_col_list(fk['from_cols'])}) "
+                f"REFERENCES {mssql_name(fk['to_table'])} ({fk_col_list(fk['to_cols'])})"
                 f"{actions};"
             )
 
@@ -550,8 +555,8 @@ def generate_diff_ddl(
             lines.append(
                 f"ALTER TABLE {mssql_name(tbl_name)} "
                 f"ADD CONSTRAINT `{safe_fk}` "
-                f"FOREIGN KEY ({mssql_name(fk['from_col'])}) "
-                f"REFERENCES {mssql_name(fk['to_table'])} ({mssql_name(fk['to_col'])})"
+                f"FOREIGN KEY ({fk_col_list(fk['from_cols'])}) "
+                f"REFERENCES {mssql_name(fk['to_table'])} ({fk_col_list(fk['to_cols'])})"
                 f"{actions};"
             )
 
