@@ -32,6 +32,8 @@ except ImportError:
 _parser = argparse.ArgumentParser(description="MDF → MySQL Datenmigration")
 _parser.add_argument("--dry-run",  action="store_true", help="Nur Vorschau, keine Daten schreiben")
 _parser.add_argument("--resume",   action="store_true", help="Migration von Checkpoint fortsetzen")
+_parser.add_argument("--profile",  default=None,
+                     help="Profilname aus config.json (Standard: erstes Profil)")
 _args = _parser.parse_args()
 
 # ── Log ───────────────────────────────────────────────────────────────────────
@@ -48,11 +50,16 @@ def log(msg: str) -> None:
         fh.write(line + "\n")
 
 # ── Konfiguration ─────────────────────────────────────────────────────────────
+from config_utils import select_profile
+
 with open(CFG_FILE, encoding="utf-8") as fh:
     all_cfg = json.load(fh)
 
-profile    = next(iter(all_cfg))
-cfg        = all_cfg[profile]
+try:
+    profile, cfg = select_profile(all_cfg, _args.profile)
+except ValueError as e:
+    print(f"FEHLER: {e}")
+    sys.exit(1)
 MDF_PATH   = cfg["mdf_path"]
 DB_NAME    = cfg["db_attach_name"]
 DRIVER     = cfg["driver"]
