@@ -214,6 +214,42 @@ def test_no_changes_produces_minimal_ddl():
     assert warns == []
 
 
+def test_generated_column_not_reported_as_removed():
+    # TODO 2.10: _UX_*_key-Hilfsspalten (GENERATED) sind tool-eigene
+    # Artefakte - keine Dauerwarnung "existiert nicht mehr in MDF".
+    src = {"tables": {"t1": _src_table("MyTable", [_src_col("Id", "int")])}}
+    tgt = {"tables": {"mytable": _mysql_table("mytable", [
+        _mysql_col("Id", "INT"),
+    ])}}
+    tgt["tables"]["mytable"]["columns"]["_UX_MyTable_OneDefault_key"] = {
+        "type": "VARCHAR(255)", "nullable": True, "default": None,
+        "auto_increment": False, "generated": True, "pos": 2,
+    }
+    diff = diff_schemas(src, tgt)
+    assert diff["removed_columns"] == {}
+    assert diff["warnings"] == []
+
+
+def test_generated_column_not_a_rename_candidate():
+    # Die generierte VARCHAR(255)-Hilfsspalte darf nicht als Umbenennungs-
+    # Kandidat fuer eine neue echte VARCHAR-Spalte vorgeschlagen werden
+    # (der bestaetigte Rename wuerde sie DROPpen!).
+    src = {"tables": {"t1": _src_table("MyTable", [
+        _src_col("Id", "int", pos=1),
+        _src_col("NewName", "nvarchar", max_len=255, pos=2),
+    ])}}
+    tgt = {"tables": {"mytable": _mysql_table("mytable", [
+        _mysql_col("Id", "INT", pos=1),
+    ])}}
+    tgt["tables"]["mytable"]["columns"]["_UX_MyTable_OneDefault_key"] = {
+        "type": "VARCHAR(255)", "nullable": True, "default": None,
+        "auto_increment": False, "generated": True, "pos": 2,
+    }
+    diff = diff_schemas(src, tgt)
+    candidates = detect_rename_candidates(diff, src, tgt)
+    assert candidates == {}
+
+
 def test_datetime_fsp_zero_equals_plain_datetime():
     # TODO 2.6: datetime2(0) -> DATETIME; MySQL meldet "datetime" -> kein Diff.
     src = {"tables": {"t1": _src_table("MyTable", [
