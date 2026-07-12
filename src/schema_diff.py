@@ -66,6 +66,10 @@ def read_mysql_schema(conn, db_name: str) -> Dict[str, Any]:
             "nullable":    (nullable == "YES"),
             "default":     default,
             "auto_increment": ("auto_increment" in (extra or "").lower()),
+            # VIRTUAL/STORED GENERATED (z.B. _UX_*_key-Hilfsspalten fuer
+            # emulierte gefilterte Indexe) - vom Tool erzeugt, nicht Teil
+            # des Quellschemas
+            "generated":   ("generated" in (extra or "").lower()),
             "pos":         pos,
         }
 
@@ -280,8 +284,13 @@ def diff_schemas(source: dict, target_mysql: dict) -> dict:
                         f"{tgt_type} → {src_type} – bestehende Daten prüfen!"
                     )
 
-        # Entfernte Spalten (nur Warnung)
-        removed = [k for k in tgt_cols if k not in src_cols]
+        # Entfernte Spalten (nur Warnung). Generierte Spalten (GENERATED,
+        # z.B. _UX_*_key aus der Index-Emulation) sind tool-eigene Artefakte
+        # ohne MDF-Gegenstueck - keine Warnung, kein Rename-Kandidat.
+        removed = [
+            k for k in tgt_cols
+            if k not in src_cols and not tgt_cols[k].get("generated")
+        ]
         if removed:
             diff["removed_columns"][tbl_name] = [
                 {**tgt["columns"][c], "name": c}
