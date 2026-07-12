@@ -488,6 +488,25 @@ def generate_diff_ddl(
         lines.append(f"CREATE TABLE IF NOT EXISTS {mssql_name(tname)} (")
         lines.append(",\n".join(col_defs))
         lines.append(") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;")
+
+        # Indexe der neuen Tabelle (fehlten frueher komplett - so entstand
+        # TablePlatingRate ohne UNIQUE-Constraints, siehe #33)
+        for idx in tinfo.get("indexes", []):
+            lines.extend(render_index_ddl(tname, idx))
+
+        # Foreign Keys der neuen Tabelle (inkl. ON DELETE/UPDATE-Regeln)
+        for fk in tinfo.get("fk", []):
+            safe_fk = re.sub(r'[^a-zA-Z0-9_]', '_', fk["name"])
+            actions, fk_warns = fk_actions_sql(fk)
+            for w in fk_warns:
+                lines.append(f"-- ⚠ {w}")
+            lines.append(
+                f"ALTER TABLE {mssql_name(tname)} "
+                f"ADD CONSTRAINT `{safe_fk}` "
+                f"FOREIGN KEY ({fk_col_list(fk['from_cols'])}) "
+                f"REFERENCES {mssql_name(fk['to_table'])} ({fk_col_list(fk['to_cols'])})"
+                f"{actions};"
+            )
         lines.append("")
 
     # ── Bestehende Tabellen ändern ────────────────────────────────────────

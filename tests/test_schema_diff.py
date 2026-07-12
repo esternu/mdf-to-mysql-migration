@@ -214,6 +214,33 @@ def test_no_changes_produces_minimal_ddl():
     assert warns == []
 
 
+def test_new_table_in_diff_includes_indexes_and_fks():
+    # TODO 2.11: neue Tabelle im Diff bekam nur Spalten+PK - Indexe und
+    # FKs fehlten (so entstand TablePlatingRate ohne UNIQUE-Constraints).
+    src = {"tables": {"t1": _src_table(
+        "TablePlatingRate",
+        [_src_col("Id", "int", nullable=False, identity=True),
+         _src_col("PlatingId", "int", nullable=False),
+         _src_col("Current Density", "float", nullable=False)],
+        pk=["Id"],
+        fk=[{"name": "FK_TablePlatingRate_TablePlating",
+             "from_cols": ["PlatingId"], "to_cols": ["Id"],
+             "to_schema": "dbo", "to_table": "TablePlating",
+             "on_delete": "CASCADE", "on_update": "NO_ACTION"}],
+        indexes=[{"name": "UX_TablePlatingRate_Plating_CD", "unique": True,
+                  "filter": None,
+                  "columns": [{"name": "PlatingId", "desc": False},
+                              {"name": "Current Density", "desc": False}]}],
+    )}}
+    tgt  = {"tables": {}}
+    diff = diff_schemas(src, tgt)
+    ddl, _ = generate_diff_ddl(diff, src, "testdb")
+    assert "CREATE TABLE IF NOT EXISTS `TablePlatingRate`" in ddl
+    assert "CREATE UNIQUE INDEX `UX_TablePlatingRate_Plating_CD`" in ddl
+    assert "ADD CONSTRAINT `FK_TablePlatingRate_TablePlating`" in ddl
+    assert "ON DELETE CASCADE;" in ddl
+
+
 def test_generated_column_not_reported_as_removed():
     # TODO 2.10: _UX_*_key-Hilfsspalten (GENERATED) sind tool-eigene
     # Artefakte - keine Dauerwarnung "existiert nicht mehr in MDF".
