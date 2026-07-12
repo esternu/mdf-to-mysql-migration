@@ -244,15 +244,15 @@ def test_datetime_fsp_mismatch_detected():
 def _fk_src_table():
     return _src_table("Orders", [_src_col("Id", "int"), _src_col("UserId", "int")],
                       pk=["Id"],
-                      fk=[{"name": "FK_Orders_Users", "from_col": "UserId",
-                           "to_schema": "dbo", "to_table": "Users", "to_col": "Id",
+                      fk=[{"name": "FK_Orders_Users", "from_cols": ["UserId"],
+                           "to_schema": "dbo", "to_table": "Users", "to_cols": ["Id"],
                            "on_delete": "CASCADE", "on_update": "NO_ACTION"}])
 
 
 def _fk_mysql_table(on_delete="RESTRICT"):
     t = _mysql_table("orders", [_mysql_col("Id", "INT"), _mysql_col("UserId", "INT")])
     t["fks"]["FK_Orders_Users"] = {
-        "from_col": "UserId", "to_table": "Users", "to_col": "Id",
+        "from_cols": ["UserId"], "to_table": "Users", "to_cols": ["Id"],
         "on_delete": on_delete, "on_update": "RESTRICT",
     }
     return t

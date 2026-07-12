@@ -307,18 +307,29 @@ def read_schema(session: MdfSession, log) -> dict:
             fk.update_referential_action_desc                             AS on_update
         FROM sys.foreign_keys        fk
         JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
-        ORDER BY from_schema, from_table
+        ORDER BY from_schema, from_table, fk.name, fkc.constraint_column_id
     """)
     for row in cur.fetchall():
         fk_name, fs, ft, fc, ts, tt, tc, on_del, on_upd = row
         key = f"{fs}.{ft}"
-        if key in schema["tables"]:
-            schema["tables"][key]["fk"].append({
-                "name": fk_name, "from_col": fc,
-                "to_schema": ts, "to_table": tt, "to_col": tc,
+        if key not in schema["tables"]:
+            continue
+        # Composite-FKs: Spalten pro Constraint-Name gruppieren - ein
+        # Eintrag pro Spaltenpaar ergaebe zwei ADD CONSTRAINT mit
+        # identischem Namen (zweiter schlaegt fehl).
+        fk_list  = schema["tables"][key]["fk"]
+        fk_entry = next((f for f in fk_list if f["name"] == fk_name), None)
+        if fk_entry is None:
+            fk_entry = {
+                "name": fk_name,
+                "from_cols": [], "to_cols": [],
+                "to_schema": ts, "to_table": tt,
                 "on_delete": on_del or "NO_ACTION",
                 "on_update": on_upd or "NO_ACTION",
-            })
+            }
+            fk_list.append(fk_entry)
+        fk_entry["from_cols"].append(fc)
+        fk_entry["to_cols"].append(tc)
 
     # ── Indexes (UNIQUE + Non-Clustered, ohne PKs) ────────────────────────
     # Erfasst auch table-level UNIQUE CONSTRAINTs (is_unique_constraint=1) -

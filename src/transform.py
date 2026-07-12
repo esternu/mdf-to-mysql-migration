@@ -718,6 +718,11 @@ _FK_ACTION_SQL = {
 }
 
 
+def fk_col_list(cols: List[str]) -> str:
+    """FK-Spaltenliste: ['A', 'B'] → '`A`, `B`' (Composite-FK-Unterstützung)."""
+    return ", ".join(mssql_name(c) for c in cols)
+
+
 def fk_actions_sql(fk: dict) -> Tuple[str, List[str]]:
     """Erzeugt die ON DELETE/ON UPDATE-Klauseln eines FK-Eintrags.
 
@@ -793,8 +798,8 @@ def generate_mysql_ddl(schema: dict, target_db: str) -> str:
             lines.append(
                 f"ALTER TABLE {mssql_name(tinfo['name'])} "
                 f"ADD CONSTRAINT `{safe_fk}` "
-                f"FOREIGN KEY ({mssql_name(fk['from_col'])}) "
-                f"REFERENCES {mssql_name(fk['to_table'])} ({mssql_name(fk['to_col'])})"
+                f"FOREIGN KEY ({fk_col_list(fk['from_cols'])}) "
+                f"REFERENCES {mssql_name(fk['to_table'])} ({fk_col_list(fk['to_cols'])})"
                 f"{actions};"
             )
     if any(tinfo["fk"] for tinfo in schema["tables"].values()):

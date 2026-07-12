@@ -679,8 +679,8 @@ _FK_SCHEMA = {
                  "default": None, "identity": False},
             ],
             "pk": ["Id"],
-            "fk": [{"name": "FK_Orders_Users", "from_col": "UserId",
-                    "to_schema": "dbo", "to_table": "Users", "to_col": "Id",
+            "fk": [{"name": "FK_Orders_Users", "from_cols": ["UserId"],
+                    "to_schema": "dbo", "to_table": "Users", "to_cols": ["Id"],
                     "on_delete": "CASCADE", "on_update": "NO_ACTION"}],
         },
     },
@@ -820,6 +820,20 @@ class TestGenerateMysqlDdl:
         schema["tables"]["dbo.Orders"]["fk"][0]["on_delete"] = "SET_NULL"
         ddl = generate_mysql_ddl(schema, "TestDB")
         assert "ON DELETE SET NULL;" in ddl
+
+    def test_composite_foreign_key_single_constraint(self):
+        # TODO 2.9: mehrspaltiger FK -> EIN ADD CONSTRAINT mit Spaltenlisten
+        import copy
+        schema = copy.deepcopy(_FK_SCHEMA)
+        schema["tables"]["dbo.Orders"]["fk"] = [{
+            "name": "FK_Orders_Composite", "from_cols": ["UserId", "TenantId"],
+            "to_schema": "dbo", "to_table": "Users", "to_cols": ["Id", "Tenant"],
+            "on_delete": "NO_ACTION", "on_update": "NO_ACTION",
+        }]
+        ddl = generate_mysql_ddl(schema, "TestDB")
+        assert ddl.count("ADD CONSTRAINT `FK_Orders_Composite`") == 1
+        assert "FOREIGN KEY (`UserId`, `TenantId`)" in ddl
+        assert "REFERENCES `Users` (`Id`, `Tenant`)" in ddl
 
     def test_view_included_after_tables(self):
         schema = dict(_MINIMAL_SCHEMA)
