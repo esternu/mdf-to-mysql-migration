@@ -131,3 +131,7 @@ if result["errors"]:
 else:
     log("✓ Keine Fehler.")
 log(f"Log: {_LOG_FILE}")
+
+# Exit-Code fuer Skripte/CI: 1 bei Fehlern oder Abbruch, sonst 0
+if result["errors"] or result.get("cancelled"):
+    sys.exit(1)
