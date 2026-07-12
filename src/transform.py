@@ -768,6 +768,19 @@ def generate_mysql_ddl(schema: dict, target_db: str) -> str:
     # ── Tabellen ──────────────────────────────────────────────────────────
     for tinfo in schema["tables"].values():
         tname    = tinfo["name"]
+
+        # Berechnete Spalten (MSSQL computed columns): werden als normale
+        # Spalten angelegt (haelt die Datenmigration konsistent), aber die
+        # Formel geht verloren - Werte aktualisieren sich nicht mehr!
+        computed = [c["name"] for c in tinfo["columns"] if c.get("computed")]
+        for cname in computed:
+            lines.append(
+                f"-- ⚠ {tname}.{cname} ist in MSSQL eine BERECHNETE Spalte - "
+                f"wird als normale Spalte angelegt, Formel nicht uebernommen. "
+                f"Werte veralten bei Aenderungen! Ggf. als GENERATED ALWAYS AS "
+                f"nachbauen."
+            )
+
         col_defs = []
         for c in tinfo["columns"]:
             mysql_type = convert_type(c["type"], c["max_len"], c["precision"], c["scale"])

@@ -254,7 +254,9 @@ def read_schema(session: MdfSession, log) -> dict:
             COALESCE(c.NUMERIC_SCALE, c.DATETIME_PRECISION) AS NUMERIC_SCALE,
             c.COLUMN_DEFAULT,
             COLUMNPROPERTY(OBJECT_ID(t.TABLE_SCHEMA+'.'+t.TABLE_NAME),
-                           c.COLUMN_NAME, 'IsIdentity') AS IS_IDENTITY
+                           c.COLUMN_NAME, 'IsIdentity') AS IS_IDENTITY,
+            COLUMNPROPERTY(OBJECT_ID(t.TABLE_SCHEMA+'.'+t.TABLE_NAME),
+                           c.COLUMN_NAME, 'IsComputed') AS IS_COMPUTED
         FROM INFORMATION_SCHEMA.TABLES  t
         JOIN INFORMATION_SCHEMA.COLUMNS c
             ON c.TABLE_SCHEMA = t.TABLE_SCHEMA
@@ -263,7 +265,7 @@ def read_schema(session: MdfSession, log) -> dict:
         ORDER BY t.TABLE_SCHEMA, t.TABLE_NAME, c.ORDINAL_POSITION
     """)
     for row in cur.fetchall():
-        tschema, tname, col, pos, nullable, dtype, maxlen, prec, scale, default, is_id = row
+        tschema, tname, col, pos, nullable, dtype, maxlen, prec, scale, default, is_id, is_comp = row
         key = f"{tschema}.{tname}"
         if key not in schema["tables"]:
             schema["tables"][key] = {
@@ -274,6 +276,7 @@ def read_schema(session: MdfSession, log) -> dict:
             "name": col, "pos": pos, "nullable": nullable == "YES",
             "type": dtype, "max_len": maxlen, "precision": prec, "scale": scale,
             "default": default, "identity": bool(is_id),
+            "computed": bool(is_comp),
         })
 
     # ── Primary Keys ──────────────────────────────────────────────────────

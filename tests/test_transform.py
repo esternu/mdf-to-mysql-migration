@@ -821,6 +821,23 @@ class TestGenerateMysqlDdl:
         ddl = generate_mysql_ddl(schema, "TestDB")
         assert "ON DELETE SET NULL;" in ddl
 
+    def test_computed_column_warning_in_ddl(self):
+        # TODO 3.4: berechnete Spalte erzeugt Warnkommentar im DDL
+        import copy
+        schema = copy.deepcopy(_MINIMAL_SCHEMA)
+        schema["tables"]["dbo.Users"]["columns"].append({
+            "name": "Total", "pos": 3, "nullable": True, "type": "float",
+            "max_len": None, "precision": None, "scale": None,
+            "default": None, "identity": False, "computed": True,
+        })
+        ddl = generate_mysql_ddl(schema, "TestDB")
+        assert "BERECHNETE Spalte" in ddl
+        assert "`Total` DOUBLE" in ddl   # bleibt als normale Spalte erhalten
+
+    def test_no_computed_warning_without_computed_columns(self):
+        ddl = generate_mysql_ddl(_MINIMAL_SCHEMA, "TestDB")
+        assert "BERECHNETE Spalte" not in ddl
+
     def test_composite_foreign_key_single_constraint(self):
         # TODO 2.9: mehrspaltiger FK -> EIN ADD CONSTRAINT mit Spaltenlisten
         import copy

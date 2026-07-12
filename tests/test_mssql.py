@@ -230,13 +230,13 @@ class TestReadSchema:
         assert "tables" in schema and "views" in schema
 
     def test_single_table_parsed(self, mocker):
-        col = ("dbo", "Users", "Id", 1, "NO", "int", None, None, None, None, 1)
+        col = ("dbo", "Users", "Id", 1, "NO", "int", None, None, None, None, 1, 0)
         session = self._session(mocker, col_rows=[col])
         schema  = read_schema(session, lambda m: None)
         assert "dbo.Users" in schema["tables"]
 
     def test_column_fields_mapped(self, mocker):
-        col = ("dbo", "Users", "Email", 2, "YES", "nvarchar", 255, None, None, None, 0)
+        col = ("dbo", "Users", "Email", 2, "YES", "nvarchar", 255, None, None, None, 0, 0)
         session = self._session(mocker, col_rows=[col])
         schema  = read_schema(session, lambda m: None)
         c = schema["tables"]["dbo.Users"]["columns"][0]
@@ -247,20 +247,20 @@ class TestReadSchema:
         assert c["identity"] is False
 
     def test_identity_column_flagged(self, mocker):
-        col = ("dbo", "Users", "Id", 1, "NO", "int", None, None, None, None, 1)
+        col = ("dbo", "Users", "Id", 1, "NO", "int", None, None, None, None, 1, 0)
         session = self._session(mocker, col_rows=[col])
         schema  = read_schema(session, lambda m: None)
         assert schema["tables"]["dbo.Users"]["columns"][0]["identity"] is True
 
     def test_primary_key_assigned(self, mocker):
-        col = ("dbo", "Users", "Id", 1, "NO", "int", None, None, None, None, 1)
+        col = ("dbo", "Users", "Id", 1, "NO", "int", None, None, None, None, 1, 0)
         pk  = ("dbo", "Users", "Id")
         session = self._session(mocker, col_rows=[col], pk_rows=[pk])
         schema  = read_schema(session, lambda m: None)
         assert "Id" in schema["tables"]["dbo.Users"]["pk"]
 
     def test_foreign_key_assigned(self, mocker):
-        col = ("dbo", "Orders", "UserId", 1, "NO", "int", None, None, None, None, 0)
+        col = ("dbo", "Orders", "UserId", 1, "NO", "int", None, None, None, None, 0, 0)
         fk  = ("FK_Orders_Users", "dbo", "Orders", "UserId", "dbo", "Users", "Id",
                "NO_ACTION", "NO_ACTION")
         session = self._session(mocker, col_rows=[col], fk_rows=[fk])
@@ -272,10 +272,23 @@ class TestReadSchema:
         assert fks[0]["to_table"]  == "Users"
         assert fks[0]["on_delete"] == "NO_ACTION"
 
+    def test_computed_column_flagged(self, mocker):
+        # TODO 3.4: IsComputed muss im Spalten-Dict landen
+        col = ("dbo", "T", "Total", 2, "YES", "float", None, None, None, None, 0, 1)
+        session = self._session(mocker, col_rows=[col])
+        schema  = read_schema(session, lambda m: None)
+        assert schema["tables"]["dbo.T"]["columns"][0]["computed"] is True
+
+    def test_normal_column_not_computed(self, mocker):
+        col = ("dbo", "T", "Name", 1, "YES", "nvarchar", 50, None, None, None, 0, 0)
+        session = self._session(mocker, col_rows=[col])
+        schema  = read_schema(session, lambda m: None)
+        assert schema["tables"]["dbo.T"]["columns"][0]["computed"] is False
+
     def test_composite_foreign_key_grouped(self, mocker):
         # TODO 2.9: mehrspaltiger FK darf nur EINEN Eintrag ergeben,
         # sonst entstehen zwei ADD CONSTRAINT mit gleichem Namen.
-        col = ("dbo", "Child", "PA", 1, "NO", "int", None, None, None, None, 0)
+        col = ("dbo", "Child", "PA", 1, "NO", "int", None, None, None, None, 0, 0)
         fk_rows = [
             ("FK_Child_Parent", "dbo", "Child", "PA", "dbo", "Parent", "A",
              "CASCADE", "NO_ACTION"),
@@ -292,7 +305,7 @@ class TestReadSchema:
     def test_foreign_key_cascade_action_read(self, mocker):
         # TODO 1.1: ON DELETE CASCADE muss aus sys.foreign_keys mitgelesen
         # werden, sonst verliert das MySQL-DDL die Kaskadenregel.
-        col = ("dbo", "Orders", "UserId", 1, "NO", "int", None, None, None, None, 0)
+        col = ("dbo", "Orders", "UserId", 1, "NO", "int", None, None, None, None, 0, 0)
         fk  = ("FK_Orders_Users", "dbo", "Orders", "UserId", "dbo", "Users", "Id",
                "CASCADE", "NO_ACTION")
         session = self._session(mocker, col_rows=[col], fk_rows=[fk])
@@ -309,8 +322,8 @@ class TestReadSchema:
         assert schema["views"]["dbo.MyView"]["name"] == "MyView"
 
     def test_multiple_tables_all_present(self, mocker):
-        col_a = ("dbo", "A", "Id", 1, "NO", "int", None, None, None, None, 1)
-        col_b = ("dbo", "B", "Id", 1, "NO", "int", None, None, None, None, 1)
+        col_a = ("dbo", "A", "Id", 1, "NO", "int", None, None, None, None, 1, 0)
+        col_b = ("dbo", "B", "Id", 1, "NO", "int", None, None, None, None, 1, 0)
         session = self._session(mocker, col_rows=[col_a, col_b])
         schema  = read_schema(session, lambda m: None)
         assert "dbo.A" in schema["tables"]
