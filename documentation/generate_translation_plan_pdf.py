@@ -263,33 +263,39 @@ def build_cover(s, story):
 def build_section1(s, story):
     story += section_header("1 · Statusübersicht", s)
     story.append(body(
-        "Stand: Branch <b>master</b> · geprüfte Dateien: "
-        "<b>src/transform.py</b>, <b>src/deploy.py</b>, <b>src/mssql.py</b>.", s))
+        "Stand: <b>2026-07-11</b> · Branch <b>improvement/todo-code-review</b> · "
+        "aktualisiert nach Abarbeitung der TODO-Liste (documentation/TODO.md, "
+        "Issues #38–#57). Geprüfte Dateien: <b>src/transform.py</b>, "
+        "<b>src/deploy.py</b>, <b>src/mssql.py</b>, <b>src/schema_diff.py</b>.", s))
     story.append(Spacer(1, 3 * mm))
 
     rows = [
         # P1 Tabellen
         ["T1a", "Typ-Mapping (alle außer TINYINT)", "P1",    "✅ implementiert"],
-        ["T1b", "TINYINT → TINYINT UNSIGNED",        "P1",    "❌ fehlt"],
+        ["T1b", "TINYINT → TINYINT UNSIGNED",        "P1",    "✅ implementiert (#18)"],
         ["T2",  "IDENTITY → AUTO_INCREMENT",          "P1",    "✅ implementiert"],
-        ["T3",  "Defaults (GETDATE → CURRENT_TS)",    "P1",    "✅ implementiert"],
+        ["T3",  "Defaults (GETDATE → CURRENT_TS)",    "P1",    "✅ implementiert (robust: #48)"],
         ["T4",  "Storage-Optionen strippen",           "P1",    "✅ implementiert"],
         ["T5a", "[name] → Backtick",                   "P1",    "✅ implementiert"],
-        ["T5b", "N'...' Unicode-Literale in Views",    "P1",    "❌ fehlt"],
+        ["T5b", "N'...' Unicode-Literale in Views",    "P1",    "n/a (MySQL kann N'...')"],
         ["T5c", "GO / SET NOCOUNT ON",                 "P1",    "n/a (MDF-Workflow)"],
         # P2 Views
         ["V1",  "STRING_AGG → GROUP_CONCAT",           "P2",    "✅ implementiert"],
         ["V2",  "ISNULL → IFNULL",                     "P2",    "✅ implementiert"],
         ["V3",  "CAST AS MONEY → DECIMAL",             "P2",    "✅ implementiert"],
-        ["V4",  "OUTER/CROSS APPLY → LEFT JOIN",       "P2",    "✅ implementiert"],
-        ["V5",  "CTE Versions-Hinweis",                "P2",    "❌ fehlt"],
+        ["V4",  "OUTER/CROSS APPLY → LEFT JOIN",       "P2",    "✅ implementiert (Fallback: #49)"],
+        ["V5",  "CTE Versions-Hinweis",                "P2",    "✅ implementiert (#42)"],
+        ["V6",  "CONVERT(typ, expr) → CAST",           "P2",    "✅ implementiert (#44)"],
+        ["V7",  "TOP n → LIMIT n",                     "P2",    "✅ implementiert (#43)"],
+        ["V8",  "LEN → CHAR_LENGTH",                   "P2",    "✅ implementiert (#40)"],
+        ["V9",  "Warnungs-Pass (DATEADD, PIVOT, …)",  "P2",    "✅ implementiert (#42)"],
         # P3 Prozedurale Logik
-        ["X1",  "MERGE → Flagging",                    "P3",    "❌ fehlt"],
-        ["X2",  "Trigger → Flagging + Hinweise",       "P3",    "❌ fehlt"],
+        ["X1",  "MERGE → Flagging",                    "P3",    "n/a (keine MERGE in Views)"],
+        ["X2",  "LastChange-Trigger → Hinweis",        "P3",    "offen (Trigger werden nicht gelesen; Ersatz: ON UPDATE CURRENT_TIMESTAMP)"],
         ["X3",  "OPENROWSET → Flagging",               "P3",    "n/a (MDF-Workflow)"],
         ["X4",  "SQLCMD-Spezifika",                    "P3",    "n/a (MDF-Workflow)"],
         # P4
-        ["P4",  "Engine-spez. Objekte → Flagging",     "P4",    "❌ fehlt"],
+        ["P4",  "Audit-Trigger-Generator",             "P4",    "✅ implementiert (#20/#24)"],
     ]
 
     # Farbe nach Status
@@ -342,9 +348,14 @@ def build_section1(s, story):
     story.append(t)
     story.append(Spacer(1, 3 * mm))
     story.append(ok_box(
-        "<b>Ergebnis P1/P2:</b> Tabellen-Layer und View-Konvertierung sind zu "
-        "<b>~85 %</b> implementiert. Die 5 offenen Punkte (T1b, T5b, V5, X2, P4) "
-        "blockieren einzelne Objekte, nicht die gesamte Migration.", s))
+        "<b>Ergebnis (Stand 2026-07-11):</b> Tabellen-Layer und View-Konvertierung "
+        "sind vollständig implementiert; nicht automatisch übersetzbare Konstrukte "
+        "erzeugen Warnungen im DDL statt still durchzulaufen. Einziger offener "
+        "Punkt: X2 (LastChange-Trigger-Hinweis) – die Trigger werden bewusst nicht "
+        "gelesen, ein ON-UPDATE-CURRENT_TIMESTAMP-Hinweis wäre nice-to-have. "
+        "Hinweis zu T5b: Die frühere Aussage, N'...'-Literale führten in MySQL zu "
+        "Syntaxfehlern, war fachlich falsch – MySQL/MariaDB unterstützen N'literal' "
+        "nativ; es gibt nichts zu übersetzen.", s))
 
 
 # ════════════════════════════════════════════════════════════════════════════

@@ -1,5 +1,28 @@
 # TODO — Code-Review MDF-to-MySQL Migration Tool
 
+> **Status: ✅ ABGEARBEITET (2026-07-12)** — alle Punkte wurden auf dem Branch
+> `improvement/todo-code-review` umgesetzt (Milestone „TODO Code-Review
+> Verbesserungen", Issues [#38](https://github.com/esternu/mdf-to-mysql-migration/issues/38)–[#58](https://github.com/esternu/mdf-to-mysql-migration/issues/58),
+> je Punkt ein eigener fix/feat-Branch, 292 Tests grün):
+>
+> | Punkt | Issue | Punkt | Issue |
+> |---|---|---|---|
+> | 1.1 FK CASCADE | #38 | 2.6 datetime2-Präzision | #47 |
+> | 1.2 Deploy-Fallback | #39 | 2.7 convert_default | #48 |
+> | 1.3 LEN→CHAR_LENGTH | #40 | 2.8 APPLY-Fallback | #49 |
+> | 1.4 Chunk-Streaming | #41 | 2.9 Composite-FKs | #50 |
+> | 2.1 View-Warnungen | #42 | 2.10 GENERATED-Spalten | #51 |
+> | 2.2 TOP→LIMIT | #43 | 2.11 Diff: neue Tabellen komplett | #52 |
+> | 2.3 CONVERT→CAST | #44 | 3.1 --profile | #53 |
+> | 2.4 Concat-Warnung | #45 | 3.2 Exit-Code | #54 |
+> | 2.5 BINARY(n) | #46 | 3.3 Thread-Logging | #55 |
+> | | | 3.4 Computed Columns | #56 |
+> | | | 3.5 Kleinigkeiten | #57 |
+> | | | 4.2 PDF-Korrektur | #58 |
+>
+> CI (P4-Randnotiz aus dem Review) existierte bereits (#37 geschlossen).
+> Das Dokument bleibt als Begründung der Befunde erhalten.
+
 **Stand:** 2026-06-28 · Branch `master` · alle 226 Tests grün
 **Geprüft:** `src/` (alle Module), `run_headless.py`, `run_migrate_data.py`, Übersetzungs­funktionen gegen MSSQL-/MySQL-Syntax, Live-Datenbank auf Synology (`Cockpit_Datenbank`).
 
