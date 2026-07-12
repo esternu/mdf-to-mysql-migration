@@ -89,6 +89,16 @@ def _win_path(path: str) -> str:
     return os.path.normpath(path).replace("/", "\\")
 
 
+def _bracket_escape(name: str) -> str:
+    """Escapt einen Bezeichner fuer [..]-Quoting (']' -> ']]')."""
+    return name.replace("]", "]]")
+
+
+def _quote_escape(name: str) -> str:
+    """Escapt einen Wert fuer '..'-Quoting ("'" -> "''")."""
+    return name.replace("'", "''")
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  MdfSession – Wrapper um pyodbc.Connection
 # ════════════════════════════════════════════════════════════════════════════
@@ -151,8 +161,8 @@ def attach_mdf(mdf_path: str, db_name: str, driver: str, log) -> MdfSession:
     cur.execute("SELECT name FROM sys.databases WHERE name = ?", db_name)
     if cur.fetchone():
         log(f"Detache vorhandene DB [{db_name}] …")
-        cur.execute(f"ALTER DATABASE [{db_name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE")
-        cur.execute(f"EXEC sp_detach_db '{db_name}', 'true'")
+        cur.execute(f"ALTER DATABASE [{_bracket_escape(db_name)}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE")
+        cur.execute(f"EXEC sp_detach_db '{_quote_escape(db_name)}', 'true'")
 
     # Kopie anhängen
     mdf_win = _win_path(tmp_mdf).replace("'", "''")
@@ -160,13 +170,13 @@ def attach_mdf(mdf_path: str, db_name: str, driver: str, log) -> MdfSession:
         ldf_win = _win_path(tmp_ldf).replace("'", "''")
         log("Hänge Kopie an (MDF + LDF) …")
         sql_attach = (
-            f"CREATE DATABASE [{db_name}] ON "
+            f"CREATE DATABASE [{_bracket_escape(db_name)}] ON "
             f"(FILENAME='{mdf_win}'), "
             f"(FILENAME='{ldf_win}') "
             f"FOR ATTACH"
         )
         sql_rebuild = (
-            f"CREATE DATABASE [{db_name}] ON "
+            f"CREATE DATABASE [{_bracket_escape(db_name)}] ON "
             f"(FILENAME='{mdf_win}') "
             f"FOR ATTACH_REBUILD_LOG"
         )
@@ -179,14 +189,14 @@ def attach_mdf(mdf_path: str, db_name: str, driver: str, log) -> MdfSession:
             cur2.execute("SELECT name FROM sys.databases WHERE name = ?", db_name)
             if cur2.fetchone():
                 cur2.execute(
-                    f"ALTER DATABASE [{db_name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE"
+                    f"ALTER DATABASE [{_bracket_escape(db_name)}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE"
                 )
-                cur2.execute(f"EXEC sp_detach_db '{db_name}', 'true'")
+                cur2.execute(f"EXEC sp_detach_db '{_quote_escape(db_name)}', 'true'")
             cur.execute(sql_rebuild)
     else:
         log("Hänge Kopie an (nur MDF, Log wird neu erstellt) …")
         cur.execute(
-            f"CREATE DATABASE [{db_name}] ON "
+            f"CREATE DATABASE [{_bracket_escape(db_name)}] ON "
             f"(FILENAME='{mdf_win}') "
             f"FOR ATTACH_REBUILD_LOG"
         )
@@ -212,9 +222,9 @@ def detach_and_cleanup(session: MdfSession, log) -> None:
         cur.execute("SELECT name FROM sys.databases WHERE name = ?", session.db_name)
         if cur.fetchone():
             cur.execute(
-                f"ALTER DATABASE [{session.db_name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE"
+                f"ALTER DATABASE [{_bracket_escape(session.db_name)}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE"
             )
-            cur.execute(f"EXEC sp_detach_db '{session.db_name}', 'true'")
+            cur.execute(f"EXEC sp_detach_db '{_quote_escape(session.db_name)}', 'true'")
             log(f"Temporäre DB [{session.db_name}] detacht.")
         else:
             log(f"Temporäre DB [{session.db_name}] war nicht angehängt – kein Detach nötig.")

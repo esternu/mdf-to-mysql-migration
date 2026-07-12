@@ -647,20 +647,29 @@ class App(tk.Tk):
                 "mysql-connector-python nicht installiert.\npip install mysql-connector-python",
             )
             return
-        try:
-            conn = mysql.connector.connect(
-                host=self.mysql_host.get().strip(),
-                port=int(self.mysql_port.get().strip()),
-                user=self.mysql_user.get().strip(),
-                password=self.mysql_pass.get(),
-                connection_timeout=5,
-            )
-            conn.close()
-            self.log("✓ MySQL-Verbindung erfolgreich.")
-            messagebox.showinfo("Verbindung OK", "MySQL-Verbindung erfolgreich!")
-        except Exception as e:
-            self.log(f"Verbindungsfehler: {e}")
-            messagebox.showerror("Verbindungsfehler", str(e))
+
+        host = self.mysql_host.get().strip()
+        port = int(self.mysql_port.get().strip())
+        user = self.mysql_user.get().strip()
+        pw   = self.mysql_pass.get()
+
+        # Verbindungsaufbau im Worker-Thread: bei nicht erreichbarem Server
+        # wuerde der 5s-Timeout sonst den Main-Thread (UI) einfrieren.
+        def task():
+            try:
+                conn = mysql.connector.connect(
+                    host=host, port=port, user=user, password=pw,
+                    connection_timeout=5,
+                )
+                conn.close()
+                self.log("✓ MySQL-Verbindung erfolgreich.")
+                self.after(0, messagebox.showinfo,
+                           "Verbindung OK", "MySQL-Verbindung erfolgreich!")
+            except Exception as e:
+                self.log(f"Verbindungsfehler: {e}")
+                self.after(0, messagebox.showerror, "Verbindungsfehler", str(e))
+
+        threading.Thread(target=task, daemon=True).start()
 
     def _deploy(self, resume: bool = False):
         if not MYSQL_OK:
