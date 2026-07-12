@@ -1,8 +1,9 @@
 """
 Headless-Runner für MDF-to-MySQL Migration.
 Führt Schema lesen → DDL generieren → MySQL deployen ohne GUI aus.
-Liest Einstellungen aus config.json (erstes Profil).
+Profilwahl: --profile <Name> (Standard: erstes Profil aus config.json).
 """
+import argparse
 import sys
 import os
 import io
@@ -38,12 +39,23 @@ def log(msg: str) -> None:
         fh.write(line + "\n")
 
 
+# ── CLI-Argumente ─────────────────────────────────────────────────────────
+_parser = argparse.ArgumentParser(description="MDF -> MySQL Headless-Migration")
+_parser.add_argument("--profile", default=None,
+                     help="Profilname aus config.json (Standard: erstes Profil)")
+_args = _parser.parse_args()
+
 # ── Konfiguration laden ───────────────────────────────────────────────────
+from config_utils import select_profile
+
 with open(CFG_FILE, encoding="utf-8") as fh:
     all_cfg = json.load(fh)
 
-profile = next(iter(all_cfg))
-cfg     = all_cfg[profile]
+try:
+    profile, cfg = select_profile(all_cfg, _args.profile)
+except ValueError as e:
+    print(f"FEHLER: {e}")
+    sys.exit(1)
 
 MDF_PATH   = cfg["mdf_path"]
 DB_NAME    = cfg["db_attach_name"]
