@@ -1,0 +1,8 @@
+# Binaerdateien: nie Zeilenenden normalisieren (LF/CRLF-Konvertierung
+# wuerde die Dateien korrumpieren)
+*.pdf  binary
+*.mdf  binary
+*.ldf  binary
+*.png  binary
+*.jpg  binary
+*.ico  binary
