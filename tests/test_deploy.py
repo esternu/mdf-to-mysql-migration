@@ -141,6 +141,29 @@ class TestConnectionParameters:
         deploy_to_mysql("SELECT 1;", "h", 3306, "u", "p", "db", _noop)
         assert mock_connect.call_args[1]["charset"] == "utf8mb4"
 
+    def test_unknown_database_falls_back_to_no_database(self, mocker):
+        # TODO 1.2: Erst-Deploy - Ziel-DB existiert noch nicht (Fehler 1049).
+        # Fallback: ohne database verbinden, das Voll-DDL macht CREATE+USE.
+        err = mysql.connector.Error(msg="Unknown database 'TestDB'", errno=1049)
+        conn = _MockConn(_MockCursor())
+        mock_connect = mocker.patch(
+            "mysql.connector.connect", side_effect=[err, conn],
+        )
+        log_lines: list = []
+        deploy_to_mysql("CREATE DATABASE IF NOT EXISTS `TestDB`;",
+                        "h", 3306, "u", "p", "TestDB", log_lines.append)
+        assert mock_connect.call_count == 2
+        assert "database" in mock_connect.call_args_list[0][1]
+        assert "database" not in mock_connect.call_args_list[1][1]
+        assert any("existiert noch nicht" in l for l in log_lines)
+
+    def test_other_connect_errors_still_raise(self, mocker):
+        # Nur 1049 loest den Fallback aus - Zugriffsfehler etc. weiterhin raise.
+        err = mysql.connector.Error(msg="Access denied", errno=1045)
+        mocker.patch("mysql.connector.connect", side_effect=err)
+        with pytest.raises(mysql.connector.Error):
+            deploy_to_mysql("SELECT 1;", "h", 3306, "u", "p", "db", _noop)
+
     def test_target_db_selected_on_connect(self, mocker):
         # Ohne database= schlagen ALTER/CREATE TABLE mit "No database
         # selected" fehl, sobald Tabellennamen nicht voll qualifiziert sind.

@@ -214,6 +214,145 @@ def test_no_changes_produces_minimal_ddl():
     assert warns == []
 
 
+def test_new_table_in_diff_includes_indexes_and_fks():
+    # TODO 2.11: neue Tabelle im Diff bekam nur Spalten+PK - Indexe und
+    # FKs fehlten (so entstand TablePlatingRate ohne UNIQUE-Constraints).
+    src = {"tables": {"t1": _src_table(
+        "TablePlatingRate",
+        [_src_col("Id", "int", nullable=False, identity=True),
+         _src_col("PlatingId", "int", nullable=False),
+         _src_col("Current Density", "float", nullable=False)],
+        pk=["Id"],
+        fk=[{"name": "FK_TablePlatingRate_TablePlating",
+             "from_cols": ["PlatingId"], "to_cols": ["Id"],
+             "to_schema": "dbo", "to_table": "TablePlating",
+             "on_delete": "CASCADE", "on_update": "NO_ACTION"}],
+        indexes=[{"name": "UX_TablePlatingRate_Plating_CD", "unique": True,
+                  "filter": None,
+                  "columns": [{"name": "PlatingId", "desc": False},
+                              {"name": "Current Density", "desc": False}]}],
+    )}}
+    tgt  = {"tables": {}}
+    diff = diff_schemas(src, tgt)
+    ddl, _ = generate_diff_ddl(diff, src, "testdb")
+    assert "CREATE TABLE IF NOT EXISTS `TablePlatingRate`" in ddl
+    assert "CREATE UNIQUE INDEX `UX_TablePlatingRate_Plating_CD`" in ddl
+    assert "ADD CONSTRAINT `FK_TablePlatingRate_TablePlating`" in ddl
+    assert "ON DELETE CASCADE;" in ddl
+
+
+def test_generated_column_not_reported_as_removed():
+    # TODO 2.10: _UX_*_key-Hilfsspalten (GENERATED) sind tool-eigene
+    # Artefakte - keine Dauerwarnung "existiert nicht mehr in MDF".
+    src = {"tables": {"t1": _src_table("MyTable", [_src_col("Id", "int")])}}
+    tgt = {"tables": {"mytable": _mysql_table("mytable", [
+        _mysql_col("Id", "INT"),
+    ])}}
+    tgt["tables"]["mytable"]["columns"]["_UX_MyTable_OneDefault_key"] = {
+        "type": "VARCHAR(255)", "nullable": True, "default": None,
+        "auto_increment": False, "generated": True, "pos": 2,
+    }
+    diff = diff_schemas(src, tgt)
+    assert diff["removed_columns"] == {}
+    assert diff["warnings"] == []
+
+
+def test_generated_column_not_a_rename_candidate():
+    # Die generierte VARCHAR(255)-Hilfsspalte darf nicht als Umbenennungs-
+    # Kandidat fuer eine neue echte VARCHAR-Spalte vorgeschlagen werden
+    # (der bestaetigte Rename wuerde sie DROPpen!).
+    src = {"tables": {"t1": _src_table("MyTable", [
+        _src_col("Id", "int", pos=1),
+        _src_col("NewName", "nvarchar", max_len=255, pos=2),
+    ])}}
+    tgt = {"tables": {"mytable": _mysql_table("mytable", [
+        _mysql_col("Id", "INT", pos=1),
+    ])}}
+    tgt["tables"]["mytable"]["columns"]["_UX_MyTable_OneDefault_key"] = {
+        "type": "VARCHAR(255)", "nullable": True, "default": None,
+        "auto_increment": False, "generated": True, "pos": 2,
+    }
+    diff = diff_schemas(src, tgt)
+    candidates = detect_rename_candidates(diff, src, tgt)
+    assert candidates == {}
+
+
+def test_datetime_fsp_zero_equals_plain_datetime():
+    # TODO 2.6: datetime2(0) -> DATETIME; MySQL meldet "datetime" -> kein Diff.
+    src = {"tables": {"t1": _src_table("MyTable", [
+        _src_col("CreatedAt", "datetime2", scale=0),
+    ])}}
+    tgt = {"tables": {"mytable": _mysql_table("mytable", [
+        _mysql_col("CreatedAt", "DATETIME"),
+    ])}}
+    diff = diff_schemas(src, tgt)
+    assert diff["altered_tables"] == {}
+
+
+def test_datetime_fsp_mismatch_detected():
+    # Bestehende DATETIME(6)-Spalte vs. Quelle datetime2(0) -> Typkorrektur.
+    src = {"tables": {"t1": _src_table("MyTable", [
+        _src_col("CreatedAt", "datetime2", scale=0),
+    ])}}
+    tgt = {"tables": {"mytable": _mysql_table("mytable", [
+        _mysql_col("CreatedAt", "DATETIME(6)"),
+    ])}}
+    diff = diff_schemas(src, tgt)
+    mods = diff["altered_tables"]["MyTable"]["modified_columns"]
+    assert mods[0] == ("CreatedAt", "DATETIME(6)", "DATETIME")
+
+
+# ── Tests: FK-Regeln (ON DELETE/UPDATE) ───────────────────────────────────────
+
+def _fk_src_table():
+    return _src_table("Orders", [_src_col("Id", "int"), _src_col("UserId", "int")],
+                      pk=["Id"],
+                      fk=[{"name": "FK_Orders_Users", "from_cols": ["UserId"],
+                           "to_schema": "dbo", "to_table": "Users", "to_cols": ["Id"],
+                           "on_delete": "CASCADE", "on_update": "NO_ACTION"}])
+
+
+def _fk_mysql_table(on_delete="RESTRICT"):
+    t = _mysql_table("orders", [_mysql_col("Id", "INT"), _mysql_col("UserId", "INT")])
+    t["fks"]["FK_Orders_Users"] = {
+        "from_cols": ["UserId"], "to_table": "Users", "to_cols": ["Id"],
+        "on_delete": on_delete, "on_update": "RESTRICT",
+    }
+    return t
+
+
+def test_fk_rule_mismatch_detected_and_fixed():
+    # TODO 1.1: Live-DB hat RESTRICT, Quelle will CASCADE -> DROP + ADD im Diff.
+    src  = {"tables": {"t1": _fk_src_table()}}
+    tgt  = {"tables": {"orders": _fk_mysql_table("RESTRICT")}}
+    diff = diff_schemas(src, tgt)
+    assert len(diff["altered_tables"]["Orders"]["modified_fks"]) == 1
+    assert any("FK-Regel weicht ab" in w for w in diff["warnings"])
+
+    ddl, _ = generate_diff_ddl(diff, src, "testdb")
+    assert "DROP FOREIGN KEY `FK_Orders_Users`" in ddl
+    assert "ON DELETE CASCADE;" in ddl
+
+
+def test_fk_rule_match_produces_no_change():
+    # NO_ACTION (MSSQL) und RESTRICT (MySQL) sind gleichwertig -> kein Diff.
+    src = {"tables": {"t1": _fk_src_table()}}
+    src["tables"]["t1"]["fk"][0]["on_delete"] = "NO_ACTION"
+    tgt  = {"tables": {"orders": _fk_mysql_table("RESTRICT")}}
+    diff = diff_schemas(src, tgt)
+    assert diff["altered_tables"] == {}
+
+
+def test_new_fk_in_diff_carries_cascade():
+    src = {"tables": {"t1": _fk_src_table()}}
+    tgt = {"tables": {"orders": _mysql_table("orders", [
+        _mysql_col("Id", "INT"), _mysql_col("UserId", "INT")])}}
+    diff = diff_schemas(src, tgt)
+    ddl, _ = generate_diff_ddl(diff, src, "testdb")
+    assert "ADD CONSTRAINT `FK_Orders_Users`" in ddl
+    assert "ON DELETE CASCADE;" in ddl
+
+
 # ── Tests: detect_rename_candidates ───────────────────────────────────────────
 
 def test_rename_candidate_detected_when_unambiguous():

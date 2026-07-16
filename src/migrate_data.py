@@ -54,10 +54,12 @@ def get_table_list(session) -> List[TableEntry]:
 # ════════════════════════════════════════════════════════════════════════════
 #  2) Zeilenzahlen vorab ermitteln
 # ════════════════════════════════════════════════════════════════════════════
-def get_row_counts(session, tables: List[TableEntry]) -> Dict[str, int]:
+def get_row_counts(session, tables: List[TableEntry]) -> Dict[TableEntry, int]:
     """Liest Zeilenzahlen aus sys.partitions (schnell, ohne COUNT(*)-Scan).
 
-    Gibt ein Dict {table_name: row_count} zurück.
+    Gibt ein Dict {(schema, table_name): row_count} zurück – der Schluessel
+    ist Schema-qualifiziert, damit gleichnamige Tabellen in verschiedenen
+    Schemata nicht kollidieren.
     Tabellen ohne Eintrag (z.B. leere Heap-Tabellen) erhalten den Wert 0.
     """
     cur = session.cursor()
@@ -70,13 +72,13 @@ def get_row_counts(session, tables: List[TableEntry]) -> Dict[str, int]:
         WHERE p.index_id IN (0, 1)   -- 0 = heap, 1 = clustered index
         GROUP BY p.object_id
     """)
-    counts: Dict[str, int] = {}
+    counts: Dict[TableEntry, int] = {}
     for tschema, tname, cnt in cur.fetchall():
-        counts[tname] = int(cnt or 0)
+        counts[(tschema, tname)] = int(cnt or 0)
 
     # Tabellen die nicht in sys.partitions auftauchen → 0
-    for _, tname in tables:
-        counts.setdefault(tname, 0)
+    for entry in tables:
+        counts.setdefault(entry, 0)
     return counts
 
 
@@ -92,44 +94,38 @@ def iter_table_data(
 ) -> Generator[Tuple[List[str], List[Row]], None, None]:
     """Liest Spalten und Zeilen einer Tabelle in Chunks.
 
+    Eine einzige SELECT-Abfrage wird per ``cursor.fetchmany()`` gestreamt.
+    OFFSET-basiertes Paging (frueher: ``ORDER BY (SELECT NULL) OFFSET …``)
+    ist absichtlich abgeschafft: SQL Server garantiert dabei keine stabile
+    Reihenfolge zwischen den Einzelabfragen, wodurch Zeilen still doppelt
+    oder gar nicht migriert werden konnten. Die Spaltennamen kommen aus
+    ``cursor.description`` (spart die INFORMATION_SCHEMA-Abfrage).
+
     Yields
     ------
     (columns, rows)
-        columns – Spaltennamen (nur beim ersten Yield gefüllt, danach gleich)
+        columns – Spaltennamen (bei jedem Yield identisch)
         rows    – Liste von bis zu chunk_size Tupeln
     """
     cur = session.cursor()
-
-    # Spaltennamen
-    cur.execute("""
-        SELECT COLUMN_NAME
-        FROM   INFORMATION_SCHEMA.COLUMNS
-        WHERE  TABLE_SCHEMA = ? AND TABLE_NAME = ?
-        ORDER  BY ORDINAL_POSITION
-    """, schema, table)
-    columns = [row[0] for row in cur.fetchall()]
-
-    if not columns:
-        return
-
-    # Daten offset-basiert lesen (SQL Server 2012+)
-    offset = 0
-    while True:
-        if stop_event and stop_event.is_set():
+    try:
+        cur.execute(f"SELECT * FROM [{schema}].[{table}]")
+        columns = [d[0] for d in (cur.description or [])]
+        if not columns:
             return
 
-        cur.execute(
-            f"SELECT * FROM [{schema}].[{table}]"
-            f" ORDER BY (SELECT NULL)"
-            f" OFFSET {offset} ROWS FETCH NEXT {chunk_size} ROWS ONLY"
-        )
-        rows = cur.fetchall()
-        if not rows:
-            return
-        yield columns, list(rows)
-        offset += len(rows)
-        if len(rows) < chunk_size:
-            return
+        while True:
+            if stop_event and stop_event.is_set():
+                return
+            rows = cur.fetchmany(chunk_size)
+            if not rows:
+                return
+            yield columns, list(rows)
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -153,45 +149,49 @@ def migrate_table(
     int  – Anzahl importierter Zeilen (0 wenn leer oder abgebrochen).
     """
     cur = mysql_conn.cursor()
-    cur.execute(f"TRUNCATE TABLE `{table_name}`")
-    mysql_conn.commit()
-
-    rows_done   = 0
-    insert_sql  = None
-    first_chunk = True
-
-    for columns, rows in iter_table_data(session, schema, table_name, chunk_size, stop_event):
-        if stop_event and stop_event.is_set():
-            log(f"  {table_name}: abgebrochen nach {rows_done} Zeilen")
-            return rows_done
-
-        if first_chunk:
-            if not rows:
-                log(f"  {table_name}: leer – übersprungen")
-                return 0
-            col_list    = ", ".join(f"`{c}`" for c in columns)
-            placeholders = ", ".join(["%s"] * len(columns))
-            insert_sql  = f"INSERT INTO `{table_name}` ({col_list}) VALUES ({placeholders})"
-            first_chunk = False
-
-        batch = [
-            tuple(val if not isinstance(val, memoryview) else bytes(val) for val in row)
-            for row in rows
-        ]
-        cur.executemany(insert_sql, batch)
+    try:
+        cur.execute(f"TRUNCATE TABLE `{table_name}`")
         mysql_conn.commit()
-        rows_done += len(rows)
 
-        if progress_callback:
-            progress_callback(table_name, rows_done, row_count)
+        rows_done   = 0
+        insert_sql  = None
+        first_chunk = True
 
-    cur.close()
+        for columns, rows in iter_table_data(session, schema, table_name, chunk_size, stop_event):
+            if stop_event and stop_event.is_set():
+                log(f"  {table_name}: abgebrochen nach {rows_done} Zeilen")
+                return rows_done
 
-    if rows_done == 0:
-        log(f"  {table_name}: leer – übersprungen")
-    else:
-        log(f"  {table_name}: {rows_done} Zeilen importiert ✓")
-    return rows_done
+            if first_chunk:
+                if not rows:
+                    log(f"  {table_name}: leer – übersprungen")
+                    return 0
+                col_list    = ", ".join(f"`{c}`" for c in columns)
+                placeholders = ", ".join(["%s"] * len(columns))
+                insert_sql  = f"INSERT INTO `{table_name}` ({col_list}) VALUES ({placeholders})"
+                first_chunk = False
+
+            batch = [
+                tuple(val if not isinstance(val, memoryview) else bytes(val) for val in row)
+                for row in rows
+            ]
+            cur.executemany(insert_sql, batch)
+            mysql_conn.commit()
+            rows_done += len(rows)
+
+            if progress_callback:
+                progress_callback(table_name, rows_done, row_count)
+
+        if rows_done == 0:
+            log(f"  {table_name}: leer – übersprungen")
+        else:
+            log(f"  {table_name}: {rows_done} Zeilen importiert ✓")
+        return rows_done
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -290,14 +290,16 @@ def migrate_all(
     cp          = load_checkpoint(checkpoint_file)
     completed   = list(cp.get("completed") or [])
     if completed:
-        log(f"  Checkpoint: {len(completed)} Tabellen bereits migriert – werden übersprungen.")
+        cp_start = cp.get("started_at") or "unbekannt"
+        log(f"  Checkpoint: {len(completed)} Tabellen bereits migriert "
+            f"(Lauf gestartet {cp_start}) – werden übersprungen.")
 
     # ── Dry-Run: nur Übersicht loggen ─────────────────────────────────────
     if dry_run:
         log("── Dry-Run: kein Schreiben, nur Vorschau ──")
         total_rows = 0
         for schema, tname in tables:
-            cnt = row_counts.get(tname, 0)
+            cnt = row_counts.get((schema, tname), 0)
             total_rows += cnt
             if tables_whitelist is not None and tname.lower() not in tables_whitelist:
                 status = "– übersprungen (nicht in Diff)"
@@ -332,12 +334,12 @@ def migrate_all(
             result["skipped"].append(tname)
             continue
 
-        log(f"  [{idx}/{len(tables)}] {tname} (~{row_counts.get(tname, 0):,} Zeilen) …")
+        log(f"  [{idx}/{len(tables)}] {tname} (~{row_counts.get((schema, tname), 0):,} Zeilen) …")
 
         try:
             count = migrate_table(
                 mysql_conn, tname, session, schema,
-                row_counts.get(tname, 0),
+                row_counts.get((schema, tname), 0),
                 log, chunk_size, progress_callback, stop_event,
             )
             if count == 0:

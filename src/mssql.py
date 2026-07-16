@@ -89,6 +89,16 @@ def _win_path(path: str) -> str:
     return os.path.normpath(path).replace("/", "\\")
 
 
+def _bracket_escape(name: str) -> str:
+    """Escapt einen Bezeichner fuer [..]-Quoting (']' -> ']]')."""
+    return name.replace("]", "]]")
+
+
+def _quote_escape(name: str) -> str:
+    """Escapt einen Wert fuer '..'-Quoting ("'" -> "''")."""
+    return name.replace("'", "''")
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  MdfSession – Wrapper um pyodbc.Connection
 # ════════════════════════════════════════════════════════════════════════════
@@ -151,8 +161,8 @@ def attach_mdf(mdf_path: str, db_name: str, driver: str, log) -> MdfSession:
     cur.execute("SELECT name FROM sys.databases WHERE name = ?", db_name)
     if cur.fetchone():
         log(f"Detache vorhandene DB [{db_name}] …")
-        cur.execute(f"ALTER DATABASE [{db_name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE")
-        cur.execute(f"EXEC sp_detach_db '{db_name}', 'true'")
+        cur.execute(f"ALTER DATABASE [{_bracket_escape(db_name)}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE")
+        cur.execute(f"EXEC sp_detach_db '{_quote_escape(db_name)}', 'true'")
 
     # Kopie anhängen
     mdf_win = _win_path(tmp_mdf).replace("'", "''")
@@ -160,13 +170,13 @@ def attach_mdf(mdf_path: str, db_name: str, driver: str, log) -> MdfSession:
         ldf_win = _win_path(tmp_ldf).replace("'", "''")
         log("Hänge Kopie an (MDF + LDF) …")
         sql_attach = (
-            f"CREATE DATABASE [{db_name}] ON "
+            f"CREATE DATABASE [{_bracket_escape(db_name)}] ON "
             f"(FILENAME='{mdf_win}'), "
             f"(FILENAME='{ldf_win}') "
             f"FOR ATTACH"
         )
         sql_rebuild = (
-            f"CREATE DATABASE [{db_name}] ON "
+            f"CREATE DATABASE [{_bracket_escape(db_name)}] ON "
             f"(FILENAME='{mdf_win}') "
             f"FOR ATTACH_REBUILD_LOG"
         )
@@ -179,14 +189,14 @@ def attach_mdf(mdf_path: str, db_name: str, driver: str, log) -> MdfSession:
             cur2.execute("SELECT name FROM sys.databases WHERE name = ?", db_name)
             if cur2.fetchone():
                 cur2.execute(
-                    f"ALTER DATABASE [{db_name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE"
+                    f"ALTER DATABASE [{_bracket_escape(db_name)}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE"
                 )
-                cur2.execute(f"EXEC sp_detach_db '{db_name}', 'true'")
+                cur2.execute(f"EXEC sp_detach_db '{_quote_escape(db_name)}', 'true'")
             cur.execute(sql_rebuild)
     else:
         log("Hänge Kopie an (nur MDF, Log wird neu erstellt) …")
         cur.execute(
-            f"CREATE DATABASE [{db_name}] ON "
+            f"CREATE DATABASE [{_bracket_escape(db_name)}] ON "
             f"(FILENAME='{mdf_win}') "
             f"FOR ATTACH_REBUILD_LOG"
         )
@@ -212,9 +222,9 @@ def detach_and_cleanup(session: MdfSession, log) -> None:
         cur.execute("SELECT name FROM sys.databases WHERE name = ?", session.db_name)
         if cur.fetchone():
             cur.execute(
-                f"ALTER DATABASE [{session.db_name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE"
+                f"ALTER DATABASE [{_bracket_escape(session.db_name)}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE"
             )
-            cur.execute(f"EXEC sp_detach_db '{session.db_name}', 'true'")
+            cur.execute(f"EXEC sp_detach_db '{_quote_escape(session.db_name)}', 'true'")
             log(f"Temporäre DB [{session.db_name}] detacht.")
         else:
             log(f"Temporäre DB [{session.db_name}] war nicht angehängt – kein Detach nötig.")
@@ -249,10 +259,14 @@ def read_schema(session: MdfSession, log) -> dict:
             c.DATA_TYPE,
             c.CHARACTER_MAXIMUM_LENGTH,
             c.NUMERIC_PRECISION,
-            c.NUMERIC_SCALE,
+            -- Fuer datetime2/time/datetimeoffset ist NUMERIC_SCALE NULL -
+            -- die Nachkommastellen (fsp) stehen in DATETIME_PRECISION.
+            COALESCE(c.NUMERIC_SCALE, c.DATETIME_PRECISION) AS NUMERIC_SCALE,
             c.COLUMN_DEFAULT,
             COLUMNPROPERTY(OBJECT_ID(t.TABLE_SCHEMA+'.'+t.TABLE_NAME),
-                           c.COLUMN_NAME, 'IsIdentity') AS IS_IDENTITY
+                           c.COLUMN_NAME, 'IsIdentity') AS IS_IDENTITY,
+            COLUMNPROPERTY(OBJECT_ID(t.TABLE_SCHEMA+'.'+t.TABLE_NAME),
+                           c.COLUMN_NAME, 'IsComputed') AS IS_COMPUTED
         FROM INFORMATION_SCHEMA.TABLES  t
         JOIN INFORMATION_SCHEMA.COLUMNS c
             ON c.TABLE_SCHEMA = t.TABLE_SCHEMA
@@ -261,7 +275,7 @@ def read_schema(session: MdfSession, log) -> dict:
         ORDER BY t.TABLE_SCHEMA, t.TABLE_NAME, c.ORDINAL_POSITION
     """)
     for row in cur.fetchall():
-        tschema, tname, col, pos, nullable, dtype, maxlen, prec, scale, default, is_id = row
+        tschema, tname, col, pos, nullable, dtype, maxlen, prec, scale, default, is_id, is_comp = row
         key = f"{tschema}.{tname}"
         if key not in schema["tables"]:
             schema["tables"][key] = {
@@ -272,6 +286,7 @@ def read_schema(session: MdfSession, log) -> dict:
             "name": col, "pos": pos, "nullable": nullable == "YES",
             "type": dtype, "max_len": maxlen, "precision": prec, "scale": scale,
             "default": default, "identity": bool(is_id),
+            "computed": bool(is_comp),
         })
 
     # ── Primary Keys ──────────────────────────────────────────────────────
@@ -300,19 +315,34 @@ def read_schema(session: MdfSession, log) -> dict:
             COL_NAME(fkc.parent_object_id,    fkc.parent_column_id)       AS from_col,
             OBJECT_SCHEMA_NAME(fkc.referenced_object_id)                  AS to_schema,
             OBJECT_NAME(fkc.referenced_object_id)                         AS to_table,
-            COL_NAME(fkc.referenced_object_id, fkc.referenced_column_id)  AS to_col
+            COL_NAME(fkc.referenced_object_id, fkc.referenced_column_id)  AS to_col,
+            fk.delete_referential_action_desc                             AS on_delete,
+            fk.update_referential_action_desc                             AS on_update
         FROM sys.foreign_keys        fk
         JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
-        ORDER BY from_schema, from_table
+        ORDER BY from_schema, from_table, fk.name, fkc.constraint_column_id
     """)
     for row in cur.fetchall():
-        fk_name, fs, ft, fc, ts, tt, tc = row
+        fk_name, fs, ft, fc, ts, tt, tc, on_del, on_upd = row
         key = f"{fs}.{ft}"
-        if key in schema["tables"]:
-            schema["tables"][key]["fk"].append({
-                "name": fk_name, "from_col": fc,
-                "to_schema": ts, "to_table": tt, "to_col": tc,
-            })
+        if key not in schema["tables"]:
+            continue
+        # Composite-FKs: Spalten pro Constraint-Name gruppieren - ein
+        # Eintrag pro Spaltenpaar ergaebe zwei ADD CONSTRAINT mit
+        # identischem Namen (zweiter schlaegt fehl).
+        fk_list  = schema["tables"][key]["fk"]
+        fk_entry = next((f for f in fk_list if f["name"] == fk_name), None)
+        if fk_entry is None:
+            fk_entry = {
+                "name": fk_name,
+                "from_cols": [], "to_cols": [],
+                "to_schema": ts, "to_table": tt,
+                "on_delete": on_del or "NO_ACTION",
+                "on_update": on_upd or "NO_ACTION",
+            }
+            fk_list.append(fk_entry)
+        fk_entry["from_cols"].append(fc)
+        fk_entry["to_cols"].append(tc)
 
     # ── Indexes (UNIQUE + Non-Clustered, ohne PKs) ────────────────────────
     # Erfasst auch table-level UNIQUE CONSTRAINTs (is_unique_constraint=1) -

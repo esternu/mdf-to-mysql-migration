@@ -70,6 +70,25 @@ def convert_type(sql_type: str, max_len, precision, scale) -> str:
             return "TEXT" if ml <= 65535 else "MEDIUMTEXT"
         return f"VARCHAR({ml})"
 
+    # datetime2(s)/datetimeoffset(s)/time(s): Praezision (fsp) uebernehmen.
+    # SQL Server erlaubt 0-7, MySQL 0-6 → Cap bei 6. Ohne Angabe (None)
+    # bleibt der bisherige sichere Default 6. fsp 0 → Typ ohne Klammer
+    # (MySQL meldet DATETIME(0) als "datetime" zurueck).
+    if base in ("datetime2", "datetimeoffset", "time"):
+        fsp    = min(int(scale), 6) if scale is not None else 6
+        target = "TIME" if base == "time" else "DATETIME"
+        return f"{target}({fsp})" if fsp > 0 else target
+
+    # binary(n)/varbinary(n): Laenge uebernehmen, sonst legt MySQL BINARY(1)
+    # an und trunkiert Daten. varbinary(max) (= max_len -1) bleibt LONGBLOB.
+    if base in ("binary", "varbinary") and max_len is not None:
+        ml = int(max_len)
+        if ml == -1:
+            return "LONGBLOB"
+        if base == "binary":
+            return f"BINARY({min(ml, 255)})"
+        return f"VARBINARY({ml})" if ml <= 65532 else "LONGBLOB"
+
     if mysql == "DECIMAL" and precision:
         sc = scale or 0
         return f"DECIMAL({precision},{sc})"
@@ -81,27 +100,64 @@ def mssql_name(name: str) -> str:
     return f"`{name.strip('[]')}`"
 
 
-def convert_default(default_val: Optional[str]) -> Optional[str]:
+def _strip_balanced_parens(s: str) -> str:
+    """Entfernt aeussere Klammerpaare nur, wenn sie balanciert das GANZE
+    Argument umschliessen. '(N''Wert (intern)'')' verliert so nie die
+    innere schliessende Klammer (zeichenweises strip('()') tat das)."""
+    s = s.strip()
+    while s.startswith("(") and s.endswith(")"):
+        depth = 0
+        balanced = True
+        for i, ch in enumerate(s):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and i < len(s) - 1:
+                    balanced = False   # aeussere Klammer schliesst zu frueh
+                    break
+        if not balanced or depth != 0:
+            break
+        s = s[1:-1].strip()
+    return s
+
+
+def convert_default(default_val: Optional[str], mysql_type: Optional[str] = None) -> Optional[str]:
     """Konvertiert einen SQL-Server-DEFAULT-Ausdruck in MySQL-Syntax.
 
-    SQL Server speichert Defaults als '(expr)' oder '((expr))'.
-    strip("()") entfernt alle führenden/abschliessenden Klammern zeichenweise,
-    sodass '(getdate())' → 'getdate' wird (nicht 'getdate()').
+    SQL Server speichert Defaults als '(expr)' oder '((expr))' – die
+    aeusseren Klammern werden balanciert entfernt (Klammern IM Wert
+    bleiben erhalten). ``N'…'``-Unicode-Literale verlieren ihr Praefix.
+
+    ``mysql_type`` (optional): Zieltyp der Spalte. Bei GETDATE()-Defaults
+    auf DATETIME(n)-Spalten wird CURRENT_TIMESTAMP(n) erzeugt – striktes
+    MySQL 8 verlangt uebereinstimmende fsp (MariaDB toleriert beides).
     """
     if default_val is None:
         return None
-    d     = default_val.strip().strip("()")
-    lower = d.lower()
-    # Nach strip("()") sind Klammern bereits entfernt
+    d = _strip_balanced_parens(default_val)
+    # getdate() / getutcdate(): Klammern des Funktionsaufrufs entfernen
+    func = re.fullmatch(r'(getdate|getutcdate|newid)\s*\(\s*\)', d, flags=re.IGNORECASE)
+    lower = func.group(1).lower() if func else d.lower()
+
     if lower in ("getdate", "getutcdate"):
-        return "CURRENT_TIMESTAMP"
+        m = re.fullmatch(r'DATETIME\((\d)\)', (mysql_type or "").strip(), flags=re.IGNORECASE)
+        return f"CURRENT_TIMESTAMP({m.group(1)})" if m else "CURRENT_TIMESTAMP"
     if lower == "newid":
         return None   # UUID() als DEFAULT nur ab MySQL 8.x
     if lower == "1":
         return "'1'"
     if lower == "0":
         return "'0'"
-    d = d.strip("'\"")
+
+    # N'…' → '…' (MySQL braucht das Unicode-Praefix nicht; im DEFAULT
+    # wuerde der strip unten sonst ein kaputtes Literal erzeugen)
+    m = re.fullmatch(r"N\s*'(.*)'", d, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        d = m.group(1)
+    else:
+        d = d.strip("'\"")
+    d = d.replace("''", "'").replace("'", "''")   # Escaping normalisieren
     return f"'{d}'" if d else None
 
 
@@ -153,6 +209,102 @@ def _convert_string_concat(sql: str) -> str:
     return _STR_CONCAT_CHAIN.sub(_replace, sql)
 
 
+# CAST-Zieltypen: T-SQL-Typname → gueltiger MySQL-CAST-Typ.
+# (nvarchar/money etc. sind zu diesem Zeitpunkt bereits durch die
+# _VIEW_TYPE_MAP-Ersetzungen in CHAR/DECIMAL(19,4) umgeschrieben.)
+_CAST_TYPE_MAP = {
+    "INT": "SIGNED", "BIGINT": "SIGNED", "SMALLINT": "SIGNED",
+    "TINYINT": "UNSIGNED", "BIT": "UNSIGNED",
+    "FLOAT": "DOUBLE", "REAL": "FLOAT", "DOUBLE": "DOUBLE",
+    "DECIMAL": "DECIMAL", "NUMERIC": "DECIMAL",
+    "VARCHAR": "CHAR", "NVARCHAR": "CHAR", "CHAR": "CHAR", "NCHAR": "CHAR",
+    "DATETIME": "DATETIME", "DATETIME2": "DATETIME", "SMALLDATETIME": "DATETIME",
+    "DATE": "DATE", "TIME": "TIME",
+}
+
+# CAST-Typen, die keine Laengenangabe erlauben/brauchen
+_CAST_NO_LENGTH = {"SIGNED", "UNSIGNED", "DOUBLE", "FLOAT", "DATE", "DATETIME", "TIME"}
+
+
+def _split_top_level_commas(s: str) -> List[str]:
+    """Teilt einen Argument-String an Kommas der obersten Klammerebene.
+    Kommas in Klammern und String-Literalen werden ignoriert."""
+    parts: List[str] = []
+    buf:   List[str] = []
+    depth  = 0
+    in_str = False
+    for ch in s:
+        if in_str:
+            buf.append(ch)
+            if ch == "'":
+                in_str = False
+            continue
+        if ch == "'":
+            in_str = True
+            buf.append(ch)
+            continue
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        if ch == ',' and depth == 0:
+            parts.append(''.join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    parts.append(''.join(buf))
+    return parts
+
+
+def _convert_tsql_convert(sql: str, warnings: List[str]) -> str:
+    """T-SQL ``CONVERT(typ, ausdruck)`` → MySQL ``CAST(ausdruck AS typ)``.
+
+    Die Argument-Reihenfolge ist zwischen T-SQL (typ zuerst) und MySQL
+    (ausdruck zuerst) vertauscht - unuebersetzt entsteht gueltig
+    aussehendes, aber falsches SQL. Die 3-Argument-Form (Style-Nummer,
+    z.B. CONVERT(VARCHAR, datum, 104)) ist Datums-/Zahlformatierung und
+    muss manuell zu DATE_FORMAT() werden → Warnung, bleibt stehen.
+    """
+    pattern = re.compile(r'\bCONVERT\s*\(', re.IGNORECASE)
+    result: List[str] = []
+    i = 0
+    while True:
+        m = pattern.search(sql, i)
+        if not m:
+            result.append(sql[i:])
+            break
+        open_pos  = m.end() - 1
+        close_pos = _paren_close(sql, open_pos)
+        args      = [a.strip() for a in _split_top_level_commas(sql[m.end():close_pos])]
+        result.append(sql[i:m.start()])
+
+        converted = False
+        if len(args) == 2:
+            tm = re.match(r'([A-Za-z_]\w*)\s*(\(\s*\d+(?:\s*,\s*\d+)?\s*\))?$', args[0])
+            mapped = _CAST_TYPE_MAP.get(tm.group(1).upper()) if tm else None
+            if mapped:
+                length = "" if mapped in _CAST_NO_LENGTH else (tm.group(2) or "")
+                expr   = _convert_tsql_convert(args[1], warnings)   # geschachtelte CONVERTs
+                result.append(f"CAST({expr} AS {mapped}{length})")
+                converted = True
+            else:
+                warnings.append(
+                    f"CONVERT() mit nicht abbildbarem Zieltyp '{args[0]}' - manuell pruefen"
+                )
+        elif len(args) == 3:
+            warnings.append(
+                "CONVERT() mit Style-Argument (Datums-/Zahlformat) - "
+                "manuell zu DATE_FORMAT() umbauen, bleibt unuebersetzt im SQL"
+            )
+        else:
+            warnings.append("CONVERT() konnte nicht geparst werden - manuell pruefen")
+
+        if not converted:
+            result.append(sql[m.start():close_pos + 1])
+        i = close_pos + 1
+    return ''.join(result)
+
+
 def _paren_close(sql: str, open_pos: int) -> int:
     """Gibt den Index der schliessenden ')' zurück, die zu '(' an open_pos gehört."""
     depth = 1
@@ -166,14 +318,18 @@ def _paren_close(sql: str, open_pos: int) -> int:
     return i - 1
 
 
-def _convert_apply_to_join(sql: str) -> str:
+def _convert_apply_to_join(sql: str, warnings: Optional[List[str]] = None) -> str:
     """Konvertiert OUTER/CROSS APPLY zu LEFT JOIN / JOIN mit gruppierter Subquery.
 
     OUTER APPLY → LEFT JOIN (subquery + GROUP BY) ON join_condition
     CROSS APPLY → JOIN      (subquery + GROUP BY) ON join_condition
 
     Vermeidet LATERAL, das auf manchen MariaDB-Builds nicht verfügbar ist.
+    Wird die Korrelation nicht erkannt, entsteht ein Fallback-JOIN mit
+    ``ON 1=1`` + Warnung (LEFT JOIN ohne ON waere ein Syntaxfehler).
     """
+    if warnings is None:
+        warnings = []
     apply_re = re.compile(r'\b(OUTER|CROSS)\s+APPLY\s*\(', re.IGNORECASE)
     result: List[str] = []
     pos = 0
@@ -237,8 +393,15 @@ def _convert_apply_to_join(sql: str) -> str:
                 pos = alias_end
                 continue
 
-        # Fallback: Body unverändert übernehmen
-        result.append(f'{join_kw} ({body}) AS {alias}')
+        # Fallback: Korrelation nicht erkannt - ON 1=1 haelt das SQL gueltig
+        # (LEFT JOIN ohne ON ist in MySQL ein Syntaxfehler), Semantik des
+        # urspruenglichen APPLY muss aber manuell geprueft werden.
+        warnings.append(
+            f"{m.group(1).upper()} APPLY konnte nicht vollstaendig konvertiert "
+            f"werden (Korrelationsbedingung nicht erkannt) - Fallback-JOIN mit "
+            f"ON 1=1, Semantik manuell pruefen!"
+        )
+        result.append(f'{join_kw} ({body}) AS {alias} ON 1=1')
         pos = alias_end
 
     result.append(sql[pos:])
@@ -300,19 +463,68 @@ def convert_view_sql(tsql: str) -> tuple:
     sql = re.sub(r'\bGETUTCDATE\s*\(\s*\)', 'UTC_TIMESTAMP()', sql, flags=re.IGNORECASE)
     sql = re.sub(r'\bISNULL\s*\(',           'IFNULL(',         sql, flags=re.IGNORECASE)
     sql = re.sub(r'\bIIF\s*\(',              'IF(',             sql, flags=re.IGNORECASE)
-    sql = re.sub(r'\bLEN\s*\(',              'LENGTH(',         sql, flags=re.IGNORECASE)
+    # LEN() zaehlt in T-SQL ZEICHEN - MySQL LENGTH() zaehlt Bytes (utf8mb4:
+    # Umlaute = 2 Bytes!). CHAR_LENGTH() ist die korrekte Entsprechung.
+    # Verbleibende Abweichung: T-SQL LEN ignoriert nachgestellte Leerzeichen.
+    sql = re.sub(r'\bLEN\s*\(',              'CHAR_LENGTH(',    sql, flags=re.IGNORECASE)
     sql = re.sub(r'\bCHARINDEX\s*\(([^,]+),([^)]+)\)',
                  r'LOCATE(\1,\2)', sql, flags=re.IGNORECASE)
     sql = re.sub(r'\bSUBSTRING\s*\(',       'SUBSTRING(',      sql, flags=re.IGNORECASE)
 
+    # T-SQL CONVERT(typ, expr) → CAST(expr AS typ)  (vertauschte Argumente!)
+    sql = _convert_tsql_convert(sql, warnings)
+
     # WITH (NOLOCK) entfernen
     sql = re.sub(r'\bWITH\s*\(\s*NOLOCK\s*\)', '', sql, flags=re.IGNORECASE)
 
-    # TOP n entfernen
-    sql = re.sub(r'\bTOP\s+\d+\b', '', sql, flags=re.IGNORECASE)
+    # ── TOP n → LIMIT n ───────────────────────────────────────────────────
+    # Nur der eindeutige Fall wird uebersetzt: genau EIN "SELECT TOP n" im
+    # aeussersten SELECT (= erstes SELECT des Bodys) → LIMIT n am View-Ende.
+    # Alles andere (TOP in Subquery, mehrere TOPs, WITH TIES, PERCENT,
+    # TOP (ausdruck)) wird gewarnt statt still gestrichen - ersatzloses
+    # Entfernen aendert die Ergebnismenge!
+    top_matches = list(re.finditer(
+        r'\bTOP\s+(?:(\d+)\b|\(\s*[^)]*\s*\))(\s+PERCENT)?(\s+WITH\s+TIES)?',
+        sql, flags=re.IGNORECASE))
+    if top_matches:
+        first_select = re.search(r'\bSELECT\b', sql, flags=re.IGNORECASE)
+        m = top_matches[0]
+        simple = (
+            len(top_matches) == 1
+            and m.group(1) is not None            # TOP <zahl>, kein (expr)
+            and not m.group(2) and not m.group(3) # kein PERCENT / WITH TIES
+            and first_select is not None
+            # TOP folgt direkt auf das erste SELECT (aeusserste Ebene)
+            and sql[first_select.end():m.start()].strip() == ""
+        )
+        if simple:
+            limit_n = m.group(1)
+            sql = sql[:m.start()] + sql[m.end():]
+            sql = sql.rstrip().rstrip(';')
+            sql += f"\nLIMIT {limit_n}"
+            warnings.append(
+                f"TOP {limit_n} wurde zu LIMIT {limit_n} am View-Ende - "
+                f"Ergebnis pruefen (ORDER BY-Bezug!)"
+            )
+        else:
+            warnings.append(
+                "TOP-Klausel konnte nicht automatisch uebersetzt werden "
+                "(Subquery/mehrfach/PERCENT/WITH TIES/Ausdruck) - "
+                "manuell in LIMIT umbauen! TOP bleibt im SQL stehen."
+            )
 
     # ── T-SQL String-Konkatenation (+) → MySQL CONCAT() ───────────────────
     sql = _convert_string_concat(sql)
+
+    # Verbleibende '+' neben String-Literalen = nicht erkannte Kette
+    # (z.B. CAST mit 2 Klammer-Ebenen). In MySQL rechnet '+' NUMERISCH -
+    # 'text' + x ergibt still 0/Unsinn statt Konkatenation → warnen!
+    if re.search(r"'[^']*'\s*\+|\+\s*'[^']*'", sql):
+        warnings.append(
+            "String-Konkatenation mit '+' konnte nicht vollstaendig zu "
+            "CONCAT() konvertiert werden - MySQL wuerde numerisch rechnen! "
+            "Betroffene Stellen manuell auf CONCAT() umbauen."
+        )
 
     # ── STRING_AGG → GROUP_CONCAT ─────────────────────────────────────────
     def _string_agg_repl(m: re.Match) -> str:
@@ -343,7 +555,33 @@ def convert_view_sql(tsql: str) -> tuple:
     )
 
     # ── OUTER/CROSS APPLY → LEFT JOIN / JOIN (grouped subquery) ──────────
-    sql = _convert_apply_to_join(sql)
+    sql = _convert_apply_to_join(sql, warnings)
+
+    # ── Erkennungs-Pass: bekannte, NICHT automatisch übersetzbare Konstrukte ─
+    # Diese Funktionen/Klauseln haben in MySQL keine 1:1-Entsprechung oder
+    # eine abweichende Argument-Semantik. Sie bleiben unverändert im SQL
+    # stehen und werden als Warnung geflaggt (landet als -- ⚠ Kommentar im
+    # DDL), statt still durchzulaufen und erst beim Deploy zu knallen.
+    _UNSUPPORTED = [
+        (r'\bDATEADD\s*\(',      "DATEADD() – MySQL: DATE_ADD(datum, INTERVAL n einheit); manuell umbauen"),
+        (r'\bDATEDIFF\s*\(',     "DATEDIFF() – Argument-Semantik weicht ab (T-SQL: einheit,von,bis / MySQL: bis,von in Tagen); manuell umbauen"),
+        (r'\bDATEPART\s*\(',     "DATEPART() – MySQL: EXTRACT(einheit FROM datum); manuell umbauen"),
+        (r'\bDATENAME\s*\(',     "DATENAME() – MySQL: DATE_FORMAT()/MONTHNAME(); manuell umbauen"),
+        (r'\bFORMAT\s*\(',       "FORMAT() – T-SQL-.NET-Formatstrings; MySQL: DATE_FORMAT()/FORMAT(zahl,stellen); manuell pruefen"),
+        (r'\bFULL\s+OUTER\s+JOIN\b', "FULL OUTER JOIN – von MySQL nicht unterstuetzt; per LEFT JOIN UNION RIGHT JOIN nachbauen"),
+        (r'\bPIVOT\s*\(',        "PIVOT – von MySQL nicht unterstuetzt; per CASE WHEN + GROUP BY nachbauen"),
+        (r'\bUNPIVOT\s*\(',      "UNPIVOT – von MySQL nicht unterstuetzt; per UNION ALL nachbauen"),
+        (r'\bOPENJSON\s*\(',     "OPENJSON() – MySQL: JSON_TABLE() (ab 8.0/MariaDB 10.6); manuell umbauen"),
+        (r'\bSTUFF\s*\(',        "STUFF() – MySQL: INSERT(str,pos,len,neu); manuell umbauen"),
+        (r'\bPATINDEX\s*\(',     "PATINDEX() – MySQL: REGEXP_INSTR(); manuell umbauen"),
+    ]
+    for pattern, hint in _UNSUPPORTED:
+        if re.search(pattern, sql, flags=re.IGNORECASE):
+            warnings.append(f"Nicht automatisch uebersetzbar: {hint}")
+
+    # CTE-Hinweis (WITH … AS (…)): erst ab MySQL 8.0 / MariaDB 10.2 verfuegbar
+    if re.search(r'(?:^|\n)\s*WITH\b.*?\bAS\s*\(', sql, flags=re.IGNORECASE | re.DOTALL):
+        warnings.append("CTE (WITH … AS) verwendet – erfordert MySQL >= 8.0 / MariaDB >= 10.2")
 
     # Doppelte Leerzeilen bereinigen
     sql = re.sub(r'\n{3,}', '\n\n', sql)
@@ -468,6 +706,51 @@ def render_index_ddl(table_name: str, idx: dict) -> List[str]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  Foreign-Key-Referenzaktionen (ON DELETE / ON UPDATE)
+# ════════════════════════════════════════════════════════════════════════════
+# SQL-Server-Aktionsnamen (sys.foreign_keys.*_referential_action_desc) →
+# MySQL-Klausel. NO_ACTION wird weggelassen (MySQL-Default RESTRICT verhaelt
+# sich identisch). SET_DEFAULT kennt InnoDB nicht → Warnkommentar statt Klausel.
+_FK_ACTION_SQL = {
+    "CASCADE":     "CASCADE",
+    "SET_NULL":    "SET NULL",
+    "SET NULL":    "SET NULL",
+}
+
+
+def fk_col_list(cols: List[str]) -> str:
+    """FK-Spaltenliste: ['A', 'B'] → '`A`, `B`' (Composite-FK-Unterstützung)."""
+    return ", ".join(mssql_name(c) for c in cols)
+
+
+def fk_actions_sql(fk: dict) -> Tuple[str, List[str]]:
+    """Erzeugt die ON DELETE/ON UPDATE-Klauseln eines FK-Eintrags.
+
+    Returns
+    -------
+    (suffix, warnings)
+        suffix    – z.B. " ON DELETE CASCADE" (leer wenn beide NO_ACTION)
+        warnings  – Hinweise fuer nicht abbildbare Aktionen (SET_DEFAULT)
+    """
+    parts: List[str] = []
+    warns: List[str] = []
+    for key, clause in (("on_delete", "ON DELETE"), ("on_update", "ON UPDATE")):
+        action = (fk.get(key) or "NO_ACTION").upper()
+        if action in ("NO_ACTION", "NO ACTION", "RESTRICT"):
+            continue
+        mapped = _FK_ACTION_SQL.get(action)
+        if mapped:
+            parts.append(f"{clause} {mapped}")
+        else:
+            warns.append(
+                f"FK {fk['name']}: {clause} {action} wird von MySQL/InnoDB "
+                f"nicht unterstuetzt - Klausel weggelassen, manuell pruefen!"
+            )
+    suffix = (" " + " ".join(parts)) if parts else ""
+    return suffix, warns
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  DDL-Generierung
 # ════════════════════════════════════════════════════════════════════════════
 def generate_mysql_ddl(schema: dict, target_db: str) -> str:
@@ -485,12 +768,25 @@ def generate_mysql_ddl(schema: dict, target_db: str) -> str:
     # ── Tabellen ──────────────────────────────────────────────────────────
     for tinfo in schema["tables"].values():
         tname    = tinfo["name"]
+
+        # Berechnete Spalten (MSSQL computed columns): werden als normale
+        # Spalten angelegt (haelt die Datenmigration konsistent), aber die
+        # Formel geht verloren - Werte aktualisieren sich nicht mehr!
+        computed = [c["name"] for c in tinfo["columns"] if c.get("computed")]
+        for cname in computed:
+            lines.append(
+                f"-- ⚠ {tname}.{cname} ist in MSSQL eine BERECHNETE Spalte - "
+                f"wird als normale Spalte angelegt, Formel nicht uebernommen. "
+                f"Werte veralten bei Aenderungen! Ggf. als GENERATED ALWAYS AS "
+                f"nachbauen."
+            )
+
         col_defs = []
         for c in tinfo["columns"]:
             mysql_type = convert_type(c["type"], c["max_len"], c["precision"], c["scale"])
             null_str   = "" if c["nullable"] else " NOT NULL"
             auto_str   = " AUTO_INCREMENT" if c["identity"] else ""
-            default    = convert_default(c["default"]) if not c["identity"] else None
+            default    = convert_default(c["default"], mysql_type) if not c["identity"] else None
             def_str    = f" DEFAULT {default}" if default else ""
             col_defs.append(
                 f"  {mssql_name(c['name'])} {mysql_type}{null_str}{auto_str}{def_str}"
@@ -509,11 +805,15 @@ def generate_mysql_ddl(schema: dict, target_db: str) -> str:
     for tinfo in schema["tables"].values():
         for fk in tinfo["fk"]:
             safe_fk = re.sub(r'[^a-zA-Z0-9_]', '_', fk["name"])
+            actions, fk_warns = fk_actions_sql(fk)
+            for w in fk_warns:
+                lines.append(f"-- ⚠ {w}")
             lines.append(
                 f"ALTER TABLE {mssql_name(tinfo['name'])} "
                 f"ADD CONSTRAINT `{safe_fk}` "
-                f"FOREIGN KEY ({mssql_name(fk['from_col'])}) "
-                f"REFERENCES {mssql_name(fk['to_table'])} ({mssql_name(fk['to_col'])});"
+                f"FOREIGN KEY ({fk_col_list(fk['from_cols'])}) "
+                f"REFERENCES {mssql_name(fk['to_table'])} ({fk_col_list(fk['to_cols'])})"
+                f"{actions};"
             )
     if any(tinfo["fk"] for tinfo in schema["tables"].values()):
         lines.append("")

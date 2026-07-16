@@ -4,6 +4,7 @@ Deckt ab: Typkonvertierung, Bezeichner-Mapping, Default-Konvertierung,
            View-SQL-Konvertierung, topologischer Sort und DDL-Generierung.
 Keine externen Abhängigkeiten – keine Mocks erforderlich.
 """
+import re
 import pytest
 from transform import (
     convert_type,
@@ -85,6 +86,27 @@ class TestConvertType:
     def test_datetime2(self):
         assert convert_type("datetime2", None, None, None) == "DATETIME(6)"
 
+    # ── datetime2/time-Praezision (TODO 2.6) ─────────────────────────────
+    def test_datetime2_scale_zero(self):
+        # datetime2(0) (Cockpit-Standard) -> DATETIME ohne fsp, nicht (6)
+        assert convert_type("datetime2", None, None, 0) == "DATETIME"
+
+    def test_datetime2_scale_preserved(self):
+        assert convert_type("datetime2", None, None, 3) == "DATETIME(3)"
+
+    def test_datetime2_scale_capped_at_6(self):
+        # SQL Server erlaubt 7, MySQL max. 6
+        assert convert_type("datetime2", None, None, 7) == "DATETIME(6)"
+
+    def test_time_scale_preserved(self):
+        assert convert_type("time", None, None, 3) == "TIME(3)"
+
+    def test_time_scale_zero(self):
+        assert convert_type("time", None, None, 0) == "TIME"
+
+    def test_datetimeoffset_scale(self):
+        assert convert_type("datetimeoffset", None, None, 2) == "DATETIME(2)"
+
     def test_date(self):
         assert convert_type("date", None, None, None) == "DATE"
 
@@ -94,6 +116,23 @@ class TestConvertType:
 
     def test_varbinary(self):
         assert convert_type("varbinary", None, None, None) == "LONGBLOB"
+
+    # ── binary/varbinary mit Laenge (TODO 2.5) ───────────────────────────
+    def test_varbinary_max_is_longblob(self):
+        assert convert_type("varbinary", -1, None, None) == "LONGBLOB"
+
+    def test_binary_keeps_length(self):
+        # binary(16) darf NICHT zu BINARY(1) degradieren (Trunkierung!)
+        assert convert_type("binary", 16, None, None) == "BINARY(16)"
+
+    def test_binary_length_capped_at_255(self):
+        assert convert_type("binary", 400, None, None) == "BINARY(255)"
+
+    def test_varbinary_keeps_length(self):
+        assert convert_type("varbinary", 128, None, None) == "VARBINARY(128)"
+
+    def test_varbinary_huge_becomes_longblob(self):
+        assert convert_type("varbinary", 70000, None, None) == "LONGBLOB"
 
     def test_xml(self):
         assert convert_type("xml", None, None, None) == "LONGTEXT"
@@ -149,6 +188,28 @@ class TestConvertDefault:
 
     def test_empty_string_returns_none(self):
         assert convert_default("('')") is None
+
+    # ── Robustheit (TODO 2.7) ────────────────────────────────────────────
+    def test_unicode_literal_prefix_stripped(self):
+        # (N'Standard') erzeugte vorher das kaputte Literal 'N'Standard''
+        assert convert_default("(N'Standard')") == "'Standard'"
+
+    def test_inner_parens_preserved(self):
+        # zeichenweises strip("()") frass die schliessende Klammer im Wert
+        assert convert_default("('Wert (intern)')") == "'Wert (intern)'"
+
+    def test_escaped_quote_in_literal(self):
+        assert convert_default("('it''s')") == "'it''s'"
+
+    def test_getdate_with_fsp_matching_column(self):
+        # Striktes MySQL 8: DATETIME(6)-Spalte braucht CURRENT_TIMESTAMP(6)
+        assert convert_default("(getdate())", "DATETIME(6)") == "CURRENT_TIMESTAMP(6)"
+
+    def test_getdate_plain_datetime_no_fsp(self):
+        assert convert_default("(getdate())", "DATETIME") == "CURRENT_TIMESTAMP"
+
+    def test_negative_number_default(self):
+        assert convert_default("((-1))") == "'-1'"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -314,19 +375,50 @@ class TestConvertViewSql:
         result, _ = convert_view_sql("SELECT IIF(a > 0, 'yes', 'no')")
         assert result.startswith("SELECT IF(")
 
-    def test_len_to_length(self):
+    def test_len_to_char_length(self):
+        # TODO 1.3: LEN() zaehlt Zeichen -> CHAR_LENGTH(), nicht LENGTH()
+        # (LENGTH zaehlt Bytes; utf8mb4-Umlaute waeren doppelt gezaehlt).
         result, _ = convert_view_sql("SELECT LEN(col)")
-        assert "LENGTH(" in result
-        assert "LEN(" not in result
+        assert "CHAR_LENGTH(col)" in result
+        assert not re.search(r"(?<!CHAR_)LENGTH\(", result)
+
+    def test_char_length_not_double_converted(self):
+        # Bereits korrektes CHAR_LENGTH darf nicht angefasst werden.
+        result, _ = convert_view_sql("SELECT CHAR_LENGTH(col)")
+        assert result.count("CHAR_LENGTH(") == 1
 
     # Entfernte Konstrukte
     def test_nolock_removed(self):
         result, _ = convert_view_sql("SELECT * FROM t WITH (NOLOCK)")
         assert "NOLOCK" not in result
 
-    def test_top_removed(self):
-        result, _ = convert_view_sql("SELECT TOP 10 col FROM t")
+    def test_top_translated_to_limit(self):
+        # TODO 2.2: TOP n darf nicht ersatzlos verschwinden - LIMIT n am Ende.
+        result, warns = convert_view_sql("SELECT TOP 10 col FROM t")
         assert "TOP" not in result
+        assert result.rstrip().endswith("LIMIT 10")
+        assert any("LIMIT 10" in w for w in warns)
+
+    def test_top_in_subquery_warns_and_keeps_sql(self):
+        sql = "SELECT a FROM (SELECT TOP 5 a FROM t ORDER BY a) AS s"
+        result, warns = convert_view_sql(sql)
+        assert "TOP 5" in result            # bleibt stehen statt still zu verschwinden
+        assert any("manuell" in w for w in warns)
+
+    def test_top_percent_warns(self):
+        result, warns = convert_view_sql("SELECT TOP 10 PERCENT col FROM t")
+        assert any("PERCENT" in w or "manuell" in w for w in warns)
+        assert "LIMIT" not in result
+
+    def test_top_with_expression_warns(self):
+        result, warns = convert_view_sql("SELECT TOP (@n) col FROM t")
+        assert any("manuell" in w for w in warns)
+        assert "LIMIT" not in result
+
+    def test_no_top_no_limit(self):
+        result, warns = convert_view_sql("SELECT col FROM t")
+        assert "LIMIT" not in result
+        assert warns == []
 
     # STRING_AGG → GROUP_CONCAT
     def test_string_agg_with_order(self):
@@ -371,6 +463,117 @@ class TestConvertViewSql:
         result, _ = convert_view_sql(sql)
         assert "JOIN" in result
         assert "CROSS APPLY" not in result
+
+    # ── APPLY-Fallback mit ON 1=1 (TODO 2.8) ─────────────────────────────
+    def test_apply_fallback_has_on_clause(self):
+        # Body ohne erkennbare WHERE-Korrelation -> Fallback; LEFT JOIN
+        # ohne ON waere ein MySQL-Syntaxfehler.
+        sql = "SELECT * FROM a OUTER APPLY (SELECT 1 AS x) AS s"
+        result, warns = convert_view_sql(sql)
+        assert "LEFT JOIN" in result
+        assert "ON 1=1" in result
+        assert any("manuell pruefen" in w for w in warns)
+
+    def test_cross_apply_fallback_has_on_clause(self):
+        sql = "SELECT * FROM a CROSS APPLY (SELECT 1 AS x) AS s"
+        result, warns = convert_view_sql(sql)
+        assert "ON 1=1" in result
+        assert any("APPLY" in w for w in warns)
+
+    def test_recognized_apply_correlation_no_fallback_warning(self):
+        sql = ("SELECT * FROM a OUTER APPLY ("
+               "SELECT SUM(x) AS sx FROM detail d WHERE d.aid = a.id) AS s")
+        result, warns = convert_view_sql(sql)
+        assert "ON 1=1" not in result
+        assert not any("ON 1=1" in w for w in warns)
+
+    # ── Verbleibende '+'-Konkatenation warnt (TODO 2.4) ──────────────────
+    def test_unconverted_string_concat_warns(self):
+        # 2 Klammer-Ebenen im CAST -> _convert_string_concat greift nicht
+        sql = "SELECT 'x' + CAST(ROUND(SUM(a / b), 2) AS CHAR(10)) FROM t"
+        result, warns = convert_view_sql(sql)
+        if "+" in result:   # nicht konvertiert -> Warnung ist Pflicht
+            assert any("CONCAT" in w and "numerisch" in w for w in warns)
+
+    def test_plain_string_plus_column_warns_if_unconverted(self):
+        result, warns = convert_view_sql("SELECT 'Wert: ' + very_long_col_expr(x, y) FROM t")
+        if re.search(r"'[^']*'\s*\+", result):
+            assert any("numerisch" in w for w in warns)
+
+    def test_fully_converted_concat_produces_no_warning(self):
+        result, warns = convert_view_sql("SELECT col + ' (' + 'a' + ')' FROM t")
+        assert "CONCAT" in result or "+" not in result
+        assert not any("numerisch" in w for w in warns)
+
+    def test_numeric_addition_not_flagged(self):
+        _, warns = convert_view_sql("SELECT a + b FROM t")
+        assert not any("numerisch" in w for w in warns)
+
+    # ── CONVERT() → CAST() (TODO 2.3) ────────────────────────────────────
+    def test_convert_two_args_becomes_cast(self):
+        result, warns = convert_view_sql("SELECT CONVERT(INT, col) FROM t")
+        assert "CAST(col AS SIGNED)" in result
+        assert "CONVERT" not in result
+        assert warns == []
+
+    def test_convert_nvarchar_with_length(self):
+        # nvarchar wird vorher durch die Typ-Map zu CHAR - Laenge bleibt
+        result, _ = convert_view_sql("SELECT CONVERT(NVARCHAR(10), col) FROM t")
+        assert "CAST(col AS CHAR(10))" in result
+
+    def test_convert_decimal_keeps_precision(self):
+        result, _ = convert_view_sql("SELECT CONVERT(DECIMAL(18,2), col) FROM t")
+        assert "CAST(col AS DECIMAL(18,2))" in result
+
+    def test_convert_nested_expression(self):
+        result, _ = convert_view_sql("SELECT CONVERT(INT, ROUND(a / b, 0)) FROM t")
+        assert "CAST(ROUND(a / b, 0) AS SIGNED)" in result
+
+    def test_convert_with_style_warns_and_keeps(self):
+        # 3-Argument-Form = Datumsformatierung, nicht automatisch uebersetzbar
+        result, warns = convert_view_sql("SELECT CONVERT(CHAR(10), col, 104) FROM t")
+        assert "CONVERT" in result                 # bleibt stehen
+        assert any("Style" in w for w in warns)
+
+    def test_convert_unknown_type_warns(self):
+        result, warns = convert_view_sql("SELECT CONVERT(GEOGRAPHY, col) FROM t")
+        assert any("nicht abbildbarem Zieltyp" in w for w in warns)
+
+    # ── Warnungen fuer nicht uebersetzbare Konstrukte (TODO 2.1) ─────────
+    def test_dateadd_warns(self):
+        _, warns = convert_view_sql("SELECT DATEADD(day, 1, col) FROM t")
+        assert any("DATEADD" in w for w in warns)
+
+    def test_datediff_warns(self):
+        _, warns = convert_view_sql("SELECT DATEDIFF(day, a, b) FROM t")
+        assert any("DATEDIFF" in w for w in warns)
+
+    def test_full_outer_join_warns(self):
+        _, warns = convert_view_sql("SELECT * FROM a FULL OUTER JOIN b ON a.id=b.id")
+        assert any("FULL OUTER JOIN" in w for w in warns)
+
+    def test_pivot_warns(self):
+        _, warns = convert_view_sql("SELECT * FROM t PIVOT (SUM(x) FOR y IN ([a]))")
+        assert any("PIVOT" in w for w in warns)
+
+    def test_cte_version_hint(self):
+        _, warns = convert_view_sql(
+            "CREATE VIEW [dbo].[V] AS\nWITH Base AS (SELECT 1 AS n) SELECT * FROM Base")
+        assert any("CTE" in w for w in warns)
+
+    def test_clean_sql_produces_no_warnings(self):
+        _, warns = convert_view_sql("SELECT a, b FROM t WHERE a > 1")
+        assert warns == []
+
+    def test_warnings_land_in_generated_ddl(self):
+        schema = dict(_MINIMAL_SCHEMA)
+        schema = {**schema, "views": {
+            "dbo.V": {"name": "V", "schema": "dbo",
+                      "definition": "CREATE VIEW [dbo].[V] AS "
+                                    "SELECT DATEDIFF(day, a, b) AS d FROM t"}
+        }}
+        ddl = generate_mysql_ddl(schema, "TestDB")
+        assert "-- ⚠" in ddl and "DATEDIFF" in ddl
 
     # Rückgabe-Tuple
     def test_returns_tuple_of_sql_and_warnings(self):
@@ -476,8 +679,9 @@ _FK_SCHEMA = {
                  "default": None, "identity": False},
             ],
             "pk": ["Id"],
-            "fk": [{"name": "FK_Orders_Users", "from_col": "UserId",
-                    "to_schema": "dbo", "to_table": "Users", "to_col": "Id"}],
+            "fk": [{"name": "FK_Orders_Users", "from_cols": ["UserId"],
+                    "to_schema": "dbo", "to_table": "Users", "to_cols": ["Id"],
+                    "on_delete": "CASCADE", "on_update": "NO_ACTION"}],
         },
     },
     "views": {},
@@ -591,6 +795,62 @@ class TestGenerateMysqlDdl:
         assert "FOREIGN KEY" in ddl
         assert "FK_Orders_Users" in ddl
         assert "REFERENCES `Users`" in ddl
+
+    def test_foreign_key_on_delete_cascade_emitted(self):
+        # TODO 1.1: Kaskadenregel aus der Quelle muss im MySQL-DDL landen.
+        ddl = generate_mysql_ddl(_FK_SCHEMA, "TestDB")
+        assert "REFERENCES `Users` (`Id`) ON DELETE CASCADE;" in ddl
+        # NO_ACTION (on_update) erzeugt keine Klausel
+        assert "ON UPDATE" not in ddl
+
+    def test_foreign_key_set_default_warns_and_omits(self):
+        import copy
+        schema = copy.deepcopy(_FK_SCHEMA)
+        schema["tables"]["dbo.Orders"]["fk"][0]["on_delete"] = "SET_DEFAULT"
+        ddl = generate_mysql_ddl(schema, "TestDB")
+        assert "SET_DEFAULT" in ddl and "-- ⚠" in ddl   # Warnkommentar vorhanden
+        # Die eigentliche ALTER-Zeile darf keine ON DELETE-Klausel bekommen
+        alter_line = next(l for l in ddl.splitlines()
+                          if "ADD CONSTRAINT `FK_Orders_Users`" in l)
+        assert "ON DELETE" not in alter_line
+
+    def test_foreign_key_set_null_emitted(self):
+        import copy
+        schema = copy.deepcopy(_FK_SCHEMA)
+        schema["tables"]["dbo.Orders"]["fk"][0]["on_delete"] = "SET_NULL"
+        ddl = generate_mysql_ddl(schema, "TestDB")
+        assert "ON DELETE SET NULL;" in ddl
+
+    def test_computed_column_warning_in_ddl(self):
+        # TODO 3.4: berechnete Spalte erzeugt Warnkommentar im DDL
+        import copy
+        schema = copy.deepcopy(_MINIMAL_SCHEMA)
+        schema["tables"]["dbo.Users"]["columns"].append({
+            "name": "Total", "pos": 3, "nullable": True, "type": "float",
+            "max_len": None, "precision": None, "scale": None,
+            "default": None, "identity": False, "computed": True,
+        })
+        ddl = generate_mysql_ddl(schema, "TestDB")
+        assert "BERECHNETE Spalte" in ddl
+        assert "`Total` DOUBLE" in ddl   # bleibt als normale Spalte erhalten
+
+    def test_no_computed_warning_without_computed_columns(self):
+        ddl = generate_mysql_ddl(_MINIMAL_SCHEMA, "TestDB")
+        assert "BERECHNETE Spalte" not in ddl
+
+    def test_composite_foreign_key_single_constraint(self):
+        # TODO 2.9: mehrspaltiger FK -> EIN ADD CONSTRAINT mit Spaltenlisten
+        import copy
+        schema = copy.deepcopy(_FK_SCHEMA)
+        schema["tables"]["dbo.Orders"]["fk"] = [{
+            "name": "FK_Orders_Composite", "from_cols": ["UserId", "TenantId"],
+            "to_schema": "dbo", "to_table": "Users", "to_cols": ["Id", "Tenant"],
+            "on_delete": "NO_ACTION", "on_update": "NO_ACTION",
+        }]
+        ddl = generate_mysql_ddl(schema, "TestDB")
+        assert ddl.count("ADD CONSTRAINT `FK_Orders_Composite`") == 1
+        assert "FOREIGN KEY (`UserId`, `TenantId`)" in ddl
+        assert "REFERENCES `Users` (`Id`, `Tenant`)" in ddl
 
     def test_view_included_after_tables(self):
         schema = dict(_MINIMAL_SCHEMA)

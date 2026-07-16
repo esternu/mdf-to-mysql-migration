@@ -6,6 +6,7 @@ import base64
 import datetime
 import json
 import os
+import queue
 import re
 import subprocess as _subprocess
 import threading
@@ -40,8 +41,11 @@ class App(tk.Tk):
         self.title("MDF → MySQL Migration Tool")
         self.geometry("1230x760")
         self.resizable(True, True)
-        self._stop_event = threading.Event()
+        self._stop_event     = threading.Event()
+        self._log_queue      = queue.Queue()
+        self._log_file_lock  = threading.Lock()
         self._build_ui()
+        self._process_log_queue()   # Main-Thread-Konsument starten (after-Loop)
         self._load_config()
         self._check_deps()
         self._refresh_resume_btn()
@@ -302,10 +306,37 @@ class App(tk.Tk):
             fh.write(f"=== MDF-to-MySQL Migration Log  {datetime.datetime.now():%Y-%m-%d %H:%M:%S} ===\n")
 
     # ── Log-Hilfsmethoden ────────────────────────────────────────────────
+    # tkinter ist NICHT thread-sicher: log() wird aus Worker-Threads
+    # (Schema lesen, Deploy, Datenmigration) aufgerufen. Direkte Widget-
+    # Zugriffe von dort koennen sporadisch haengen/abstuerzen. Daher:
+    # log() schreibt nur in eine Queue (+ Logdatei, per Lock), der
+    # Main-Thread pollt die Queue per after() und aktualisiert das Widget.
     def log(self, msg: str):
-        ts    = datetime.datetime.now().strftime("%H:%M:%S")
-        lower = msg.lower().strip()
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        self._log_queue.put((ts, msg))
+        try:
+            with self._log_file_lock:
+                with open(LOG_FILE, "a", encoding="utf-8") as fh:
+                    fh.write(f"[{ts}] {msg}\n")
+        except OSError:
+            pass
 
+    def _process_log_queue(self):
+        """Main-Thread-Konsument: Queue leeren, ins Text-Widget schreiben."""
+        wrote = False
+        try:
+            while True:
+                ts, msg = self._log_queue.get_nowait()
+                self._append_log_line(ts, msg)
+                wrote = True
+        except queue.Empty:
+            pass
+        if wrote:
+            self.log_text.see("end")
+        self.after(100, self._process_log_queue)
+
+    def _append_log_line(self, ts: str, msg: str):
+        lower = msg.lower().strip()
         if lower.startswith("fehler") or lower.startswith("error") or "fehler:" in lower:
             tag = "error"
         elif lower.startswith("⚠") or "warnung" in lower or lower.startswith("warning"):
@@ -323,15 +354,7 @@ class App(tk.Tk):
             self.log_text.insert("end", msg + "\n", tag)
         else:
             self.log_text.insert("end", msg + "\n")
-        self.log_text.see("end")
         self.log_text.config(state="disabled")
-        self.update_idletasks()
-
-        try:
-            with open(LOG_FILE, "a", encoding="utf-8") as fh:
-                fh.write(f"[{ts}] {msg}\n")
-        except OSError:
-            pass
 
     def _clear_log(self):
         self.log_text.config(state="normal")
@@ -624,20 +647,29 @@ class App(tk.Tk):
                 "mysql-connector-python nicht installiert.\npip install mysql-connector-python",
             )
             return
-        try:
-            conn = mysql.connector.connect(
-                host=self.mysql_host.get().strip(),
-                port=int(self.mysql_port.get().strip()),
-                user=self.mysql_user.get().strip(),
-                password=self.mysql_pass.get(),
-                connection_timeout=5,
-            )
-            conn.close()
-            self.log("✓ MySQL-Verbindung erfolgreich.")
-            messagebox.showinfo("Verbindung OK", "MySQL-Verbindung erfolgreich!")
-        except Exception as e:
-            self.log(f"Verbindungsfehler: {e}")
-            messagebox.showerror("Verbindungsfehler", str(e))
+
+        host = self.mysql_host.get().strip()
+        port = int(self.mysql_port.get().strip())
+        user = self.mysql_user.get().strip()
+        pw   = self.mysql_pass.get()
+
+        # Verbindungsaufbau im Worker-Thread: bei nicht erreichbarem Server
+        # wuerde der 5s-Timeout sonst den Main-Thread (UI) einfrieren.
+        def task():
+            try:
+                conn = mysql.connector.connect(
+                    host=host, port=port, user=user, password=pw,
+                    connection_timeout=5,
+                )
+                conn.close()
+                self.log("✓ MySQL-Verbindung erfolgreich.")
+                self.after(0, messagebox.showinfo,
+                           "Verbindung OK", "MySQL-Verbindung erfolgreich!")
+            except Exception as e:
+                self.log(f"Verbindungsfehler: {e}")
+                self.after(0, messagebox.showerror, "Verbindungsfehler", str(e))
+
+        threading.Thread(target=task, daemon=True).start()
 
     def _deploy(self, resume: bool = False):
         if not MYSQL_OK:
