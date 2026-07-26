@@ -41,7 +41,11 @@ TYPE_MAP: Dict[str, str] = {
     "date":            "DATE",
     "time":            "TIME",
     "datetimeoffset":  "DATETIME(6)",
-    "timestamp":       "TIMESTAMP",
+    # SQL-Server-"timestamp" ist ein Synonym fuer rowversion (8-Byte-
+    # Nebenlaeufigkeitszaehler), KEINE Uhrzeit. MySQL TIMESTAMP waere eine
+    # echte Zeit (Bereich nur 1970-2038 UTC) - falsch. -> BINARY(8).
+    "timestamp":       "BINARY(8)",
+    "rowversion":      "BINARY(8)",
     "uniqueidentifier": "CHAR(36)",
     "varbinary":       "LONGBLOB",
     "binary":          "BINARY",
@@ -779,6 +783,17 @@ def generate_mysql_ddl(schema: dict, target_db: str) -> str:
                 f"wird als normale Spalte angelegt, Formel nicht uebernommen. "
                 f"Werte veralten bei Aenderungen! Ggf. als GENERATED ALWAYS AS "
                 f"nachbauen."
+            )
+
+        # datetimeoffset -> DATETIME: MySQL kennt keinen Zeitzonen-Offset,
+        # der Offset geht verloren. Werte ggf. vorher nach UTC normalisieren.
+        tz_cols = [c["name"] for c in tinfo["columns"]
+                   if c["type"].lower() == "datetimeoffset"]
+        for cname in tz_cols:
+            lines.append(
+                f"-- ⚠ {tname}.{cname}: datetimeoffset -> DATETIME - der "
+                f"Zeitzonen-Offset geht verloren! Werte ggf. vor der Migration "
+                f"nach UTC normalisieren."
             )
 
         col_defs = []

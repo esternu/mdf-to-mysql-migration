@@ -110,6 +110,14 @@ class TestConvertType:
     def test_date(self):
         assert convert_type("date", None, None, None) == "DATE"
 
+    # ── timestamp/rowversion ist KEINE Uhrzeit -> BINARY(8) (#63) ─────────
+    def test_timestamp_is_binary_not_time(self):
+        # SQL Server timestamp = rowversion (8-Byte-Zaehler), keine Uhrzeit.
+        assert convert_type("timestamp", None, None, None) == "BINARY(8)"
+
+    def test_rowversion_is_binary(self):
+        assert convert_type("rowversion", None, None, None) == "BINARY(8)"
+
     # Sonstige
     def test_uniqueidentifier(self):
         assert convert_type("uniqueidentifier", None, None, None) == "CHAR(36)"
@@ -837,6 +845,23 @@ class TestGenerateMysqlDdl:
     def test_no_computed_warning_without_computed_columns(self):
         ddl = generate_mysql_ddl(_MINIMAL_SCHEMA, "TestDB")
         assert "BERECHNETE Spalte" not in ddl
+
+    def test_datetimeoffset_column_warns_about_lost_offset(self):
+        # #63: datetimeoffset -> DATETIME verliert den Zeitzonen-Offset
+        import copy
+        schema = copy.deepcopy(_MINIMAL_SCHEMA)
+        schema["tables"]["dbo.Users"]["columns"].append({
+            "name": "EventAt", "pos": 3, "nullable": True, "type": "datetimeoffset",
+            "max_len": None, "precision": None, "scale": 6,
+            "default": None, "identity": False,
+        })
+        ddl = generate_mysql_ddl(schema, "TestDB")
+        assert "Zeitzonen-Offset geht verloren" in ddl
+        assert "`EventAt` DATETIME(6)" in ddl   # Spalte wird trotzdem angelegt
+
+    def test_no_offset_warning_without_datetimeoffset(self):
+        ddl = generate_mysql_ddl(_MINIMAL_SCHEMA, "TestDB")
+        assert "Zeitzonen-Offset" not in ddl
 
     def test_composite_foreign_key_single_constraint(self):
         # TODO 2.9: mehrspaltiger FK -> EIN ADD CONSTRAINT mit Spaltenlisten
