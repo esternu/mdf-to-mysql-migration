@@ -140,11 +140,22 @@ def convert_default(default_val: Optional[str], mysql_type: Optional[str] = None
     if default_val is None:
         return None
     d = _strip_balanced_parens(default_val)
-    # getdate() / getutcdate(): Klammern des Funktionsaufrufs entfernen
-    func = re.fullmatch(r'(getdate|getutcdate|newid)\s*\(\s*\)', d, flags=re.IGNORECASE)
+    # Aktuelle-Zeit-Funktionen von SQL Server auf CURRENT_TIMESTAMP abbilden:
+    # getdate/getutcdate (datetime), sysdatetime/sysutcdatetime (datetime2),
+    # sysdatetimeoffset (datetimeoffset) und ANSI current_timestamp - jeweils
+    # mit ODER ohne Klammern. Ohne diese Erkennung landet z.B. sysdatetime()
+    # als String-Literal 'sysdatetime()' im DEFAULT -> MariaDB Error 1067.
+    # newid() -> kein Default (UUID() als DEFAULT erst ab MySQL 8.x).
+    func = re.fullmatch(
+        r'(getdate|getutcdate|sysdatetime|sysutcdatetime|sysdatetimeoffset|'
+        r'current_timestamp|newid)\s*(?:\(\s*\))?',
+        d, flags=re.IGNORECASE)
     lower = func.group(1).lower() if func else d.lower()
 
-    if lower in ("getdate", "getutcdate"):
+    _NOW_FUNCS = {"getdate", "getutcdate", "sysdatetime", "sysutcdatetime",
+                  "sysdatetimeoffset", "current_timestamp"}
+    if lower in _NOW_FUNCS:
+        # fsp der Zielspalte anhaengen (striktes MySQL 8 verlangt Gleichheit)
         m = re.fullmatch(r'DATETIME\((\d)\)', (mysql_type or "").strip(), flags=re.IGNORECASE)
         return f"CURRENT_TIMESTAMP({m.group(1)})" if m else "CURRENT_TIMESTAMP"
     if lower == "newid":

@@ -185,6 +185,28 @@ class TestConvertDefault:
     def test_newid_returns_none(self):
         assert convert_default("(newid())") is None
 
+    # ── SYSDATETIME-Familie + current_timestamp (#65) ────────────────────
+    def test_sysdatetime(self):
+        # sonst DEFAULT 'sysdatetime()' -> MariaDB Error 1067
+        assert convert_default("(sysdatetime())") == "CURRENT_TIMESTAMP"
+
+    def test_sysutcdatetime(self):
+        assert convert_default("(sysutcdatetime())") == "CURRENT_TIMESTAMP"
+
+    def test_sysdatetimeoffset(self):
+        assert convert_default("(sysdatetimeoffset())") == "CURRENT_TIMESTAMP"
+
+    def test_current_timestamp_with_parens(self):
+        assert convert_default("(current_timestamp())") == "CURRENT_TIMESTAMP"
+
+    def test_current_timestamp_no_parens(self):
+        # SQL Server erlaubt DEFAULT CURRENT_TIMESTAMP ohne Klammern
+        assert convert_default("(CURRENT_TIMESTAMP)") == "CURRENT_TIMESTAMP"
+
+    def test_sysdatetime_with_fsp_from_column(self):
+        # datetime2(3) -> DATETIME(3): Default muss CURRENT_TIMESTAMP(3) sein
+        assert convert_default("(sysdatetime())", "DATETIME(3)") == "CURRENT_TIMESTAMP(3)"
+
     def test_one(self):
         assert convert_default("((1))") == "'1'"
 
@@ -862,6 +884,20 @@ class TestGenerateMysqlDdl:
     def test_no_offset_warning_without_datetimeoffset(self):
         ddl = generate_mysql_ddl(_MINIMAL_SCHEMA, "TestDB")
         assert "Zeitzonen-Offset" not in ddl
+
+    def test_sysdatetime_default_produces_valid_ddl(self):
+        # #65: datetime2(3) DEFAULT SYSDATETIME() darf NICHT als
+        # DEFAULT 'sysdatetime()' (String) landen -> MariaDB Error 1067
+        import copy
+        schema = copy.deepcopy(_MINIMAL_SCHEMA)
+        schema["tables"]["dbo.Users"]["columns"].append({
+            "name": "CreatedAt", "pos": 3, "nullable": True, "type": "datetime2",
+            "max_len": None, "precision": None, "scale": 3,
+            "default": "(sysdatetime())", "identity": False,
+        })
+        ddl = generate_mysql_ddl(schema, "TestDB")
+        assert "'sysdatetime()'" not in ddl
+        assert "`CreatedAt` DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3)" in ddl
 
     def test_composite_foreign_key_single_constraint(self):
         # TODO 2.9: mehrspaltiger FK -> EIN ADD CONSTRAINT mit Spaltenlisten
