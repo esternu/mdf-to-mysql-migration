@@ -14,7 +14,7 @@ Windows-GUI-Tool zum Migrieren von SQL Server `.mdf`-Datenbankdateien auf einen 
 
 **Deployment**
 - **Vollständig:** `DROP TABLE` + `CREATE TABLE` (Erstmigration)
-- **Schema-Diff (inkrementell):** vergleicht MDF-Schema mit dem Live-MySQL-Schema und erzeugt nur die nötigen `ALTER TABLE`/`CREATE`-Anweisungen — bestehende Daten bleiben erhalten
+- **Schema-Diff (inkrementell):** vergleicht MDF-Schema mit dem Live-MySQL-Schema und erzeugt nur die nötigen `ALTER TABLE`/`CREATE`-Anweisungen — bestehende Daten bleiben erhalten. Geänderte/neue **Views** (z. B. umbenannte View-Spalten) werden per `DROP VIEW`+`CREATE VIEW` mitsynchronisiert (Spaltensignatur-Vergleich; datenlos, daher unkritisch)
 - **Umbenennungs-Erkennung:** entfernte + neue Spalte mit gleichem Typ wird als mögliche Umbenennung erkannt; nach Bestätigung werden die Werte kopiert und die alte Spalte entfernt
 - **Dry-Run:** zeigt Diff und Datenumfang an, ohne etwas auszuführen
 

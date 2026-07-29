@@ -15,7 +15,9 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from transform import convert_type, mssql_name, render_index_ddl, fk_actions_sql, fk_col_list
+from transform import (convert_type, mssql_name, render_index_ddl, fk_actions_sql,
+                       fk_col_list, convert_view_sql, extract_view_columns,
+                       EXCLUDED_VIEWS)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -140,6 +142,20 @@ def read_mysql_schema(conn, db_name: str) -> Dict[str, Any]:
         fks[fkname]["from_cols"].append(col)
         fks[fkname]["to_cols"].append(ref_col)
 
+    # ── Views + ihre Spalten (fuer den View-Sync im Schema-Diff) ──────────
+    schema["views"] = {}
+    cur.execute("""
+        SELECT c.TABLE_NAME, c.COLUMN_NAME
+        FROM   INFORMATION_SCHEMA.VIEWS  v
+        JOIN   INFORMATION_SCHEMA.COLUMNS c
+               ON  c.TABLE_SCHEMA = v.TABLE_SCHEMA
+               AND c.TABLE_NAME   = v.TABLE_NAME
+        WHERE  v.TABLE_SCHEMA = %s
+        ORDER  BY c.TABLE_NAME, c.ORDINAL_POSITION
+    """, (db_name,))
+    for vname, cname in cur.fetchall():
+        schema["views"].setdefault(vname, {"columns": []})["columns"].append(cname)
+
     cur.close()
     return schema
 
@@ -227,6 +243,7 @@ def diff_schemas(source: dict, target_mysql: dict) -> dict:
         "altered_tables": {},
         "removed_tables": [],
         "removed_columns": {},
+        "changed_views":  [],   # neue/geänderte Views -> DROP+CREATE im Diff
         "warnings":       [],
     }
 
@@ -337,6 +354,26 @@ def diff_schemas(source: dict, target_mysql: dict) -> dict:
 
         if any(changes.values()):
             diff["altered_tables"][tbl_name] = changes
+
+    # ── Views vergleichen (Spaltensignatur) ───────────────────────────────
+    # Views werden im MySQL-Diff sonst gar nicht betrachtet. Hier: pro
+    # Quell-View die Ausgabespalten (aus dem konvertierten CREATE VIEW)
+    # gegen die Live-Spalten stellen. Weicht etwas ab (oder View fehlt in
+    # MySQL, oder Parser unsicher), wird sie neu erstellt. Unveraenderte
+    # Views bleiben unberuehrt (der "Schema aktuell"-Kurzschluss haelt).
+    tgt_views = {k.lower(): v for k, v in target_mysql.get("views", {}).items()}
+    for vinfo in source.get("views", {}).values():
+        vname = vinfo["name"]
+        if vname.lower() in EXCLUDED_VIEWS:
+            continue
+        converted, _ = convert_view_sql(vinfo["definition"])
+        src_cols = extract_view_columns(converted)
+        tgt = tgt_views.get(vname.lower())
+        tgt_cols = tgt["columns"] if tgt else None
+        if (tgt_cols is None
+                or not src_cols                       # Parser unsicher -> neu
+                or [c.lower() for c in src_cols] != [c.lower() for c in tgt_cols]):
+            diff["changed_views"].append(vinfo)
 
     return diff
 
@@ -454,7 +491,7 @@ def generate_diff_ddl(
     -------
     (ddl_string, warnings_list)
     """
-    from transform import convert_default, generate_mysql_ddl
+    from transform import convert_default, generate_mysql_ddl, _topo_sort_views
 
     rename_pairs = rename_pairs or {}
     lines: List[str] = [
@@ -591,6 +628,21 @@ def generate_diff_ddl(
     lines.append("")
     lines.append("SET FOREIGN_KEY_CHECKS = 1;")
 
+    # ── Geänderte/neue Views neu erstellen (datenlos → unkritisch) ────────
+    changed_views = diff.get("changed_views", [])
+    if changed_views:
+        lines.append("")
+        lines.append("-- Geänderte/neue Views (DROP + CREATE, topologisch sortiert)")
+        views_map = {v["name"]: v for v in changed_views}
+        for vinfo in _topo_sort_views(views_map):
+            vname = vinfo["name"]
+            vdef, vwarns = convert_view_sql(vinfo["definition"])
+            for w in vwarns:
+                warnings.append(f"View {vname}: {w}")
+            lines.append(f"DROP VIEW IF EXISTS {mssql_name(vname)};")
+            lines.append(f"CREATE VIEW {mssql_name(vname)} AS")
+            lines.append(vdef + ";")
+
     # Warnung für entfernte Elemente am Ende (umbenannte Spalten ausgenommen,
     # die wurden oben bereits per DROP COLUMN entfernt)
     renamed_old_cols = {
@@ -679,6 +731,11 @@ def format_diff_summary(diff: dict) -> str:
                         f"    ~ FK {fk['name']} ON {tname}: "
                         f"Regel → ON DELETE {_normalize_fk_action(fk.get('on_delete'))}  ⚠"
                     )
+
+    if diff.get("changed_views"):
+        lines.append(f"  Geänderte/neue Views ({len(diff['changed_views'])}) – werden neu erstellt:")
+        for v in diff["changed_views"]:
+            lines.append(f"    ~ {v['name']}")
 
     if diff["removed_tables"]:
         lines.append(f"  Entfernte Tabellen ({len(diff['removed_tables'])}) – nur Warnung:")

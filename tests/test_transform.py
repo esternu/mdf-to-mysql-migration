@@ -16,7 +16,40 @@ from transform import (
     _convert_string_concat,
     render_index_ddl,
     _parse_simple_equality_filter,
+    extract_view_columns,
 )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  extract_view_columns (View-Sync im Schema-Diff, #67)
+# ════════════════════════════════════════════════════════════════════════════
+class TestExtractViewColumns:
+    def test_simple_select(self):
+        sql, _ = convert_view_sql("SELECT a AS [Col1], b AS [Col2] FROM t")
+        assert extract_view_columns(sql) == ["Col1", "Col2"]
+
+    def test_bare_and_qualified_columns(self):
+        cols = extract_view_columns("SELECT Product, x.ProductId, `Jig Name` FROM t")
+        assert cols == ["Product", "ProductId", "Jig Name"]
+
+    def test_ignores_commas_in_functions(self):
+        cols = extract_view_columns(
+            "SELECT CAST(a / b AS DECIMAL(18,4)) AS `Rate`, COALESCE(c, 0) AS `C` FROM t")
+        assert cols == ["Rate", "C"]
+
+    def test_cte_final_select_used(self):
+        sql = ("WITH base AS (SELECT x AS `inner_x`, y AS `inner_y` FROM t) "
+               "SELECT `inner_x` AS `Out A`, `inner_y` AS `Out B` FROM base")
+        assert extract_view_columns(sql) == ["Out A", "Out B"]
+
+    def test_line_comments_stripped(self):
+        sql = ("SELECT\n  a AS `A`,\n  -- OUTPUT: something\n  b AS `B`\nFROM t")
+        assert extract_view_columns(sql) == ["A", "B"]
+
+    def test_subquery_in_select_not_confused(self):
+        cols = extract_view_columns(
+            "SELECT a AS `A`, (SELECT MAX(z) FROM sub) AS `MaxZ` FROM t")
+        assert cols == ["A", "MaxZ"]
 
 
 # ════════════════════════════════════════════════════════════════════════════

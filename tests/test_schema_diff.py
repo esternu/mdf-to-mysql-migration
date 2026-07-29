@@ -46,6 +46,67 @@ def _mysql_col(name, mysql_type, nullable=True, pos=None):
     return {"name": name, "type": mysql_type, "nullable": nullable, "pos": pos}
 
 
+def _src_view(name, tsql):
+    return {"schema": "dbo", "name": name, "definition": tsql}
+
+
+# ── Tests: View-Sync im Schema-Diff (#67) ──────────────────────────────────────
+
+def _views_src(name, tsql):
+    return {"tables": {}, "views": {f"dbo.{name}": _src_view(name, tsql)}}
+
+
+def _views_tgt(name, columns):
+    return {"tables": {}, "views": {name: {"columns": columns}}}
+
+
+def test_view_column_rename_detected():
+    # ViewSurfaceArticle-Fall: gleiche Logik, Spalte umbenannt -> neu erstellen
+    src = _views_src("V", "SELECT a AS [Bath Surface], b AS [Total Surface] FROM t")
+    tgt = _views_tgt("V", ["Article Surface", "Total Surface"])
+    diff = diff_schemas(src, tgt)
+    assert [v["name"] for v in diff["changed_views"]] == ["V"]
+
+
+def test_view_identical_columns_no_change():
+    src = _views_src("V", "SELECT a AS [Col1], b AS [Col2] FROM t")
+    tgt = _views_tgt("V", ["Col1", "Col2"])
+    diff = diff_schemas(src, tgt)
+    assert diff["changed_views"] == []
+
+
+def test_new_view_not_in_mysql_is_changed():
+    src = _views_src("V", "SELECT a AS [Col1] FROM t")
+    tgt = {"tables": {}, "views": {}}
+    diff = diff_schemas(src, tgt)
+    assert [v["name"] for v in diff["changed_views"]] == ["V"]
+
+
+def test_excluded_view_not_synced():
+    src = _views_src("ViewAuditChanges", "SELECT a AS [Col1] FROM t")
+    tgt = {"tables": {}, "views": {}}
+    diff = diff_schemas(src, tgt)
+    assert diff["changed_views"] == []
+
+
+def test_generate_diff_ddl_recreates_changed_view():
+    src = _views_src("V", "CREATE VIEW [dbo].[V] AS SELECT a AS [Bath Surface] FROM t")
+    tgt = _views_tgt("V", ["Article Surface"])
+    diff = diff_schemas(src, tgt)
+    ddl, _ = generate_diff_ddl(diff, src, "testdb")
+    assert "DROP VIEW IF EXISTS `V`;" in ddl
+    assert "CREATE VIEW `V` AS" in ddl
+    assert "`Bath Surface`" in ddl
+
+
+def test_summary_lists_changed_views():
+    src = _views_src("V", "SELECT a AS [X] FROM t")
+    tgt = _views_tgt("V", ["Y"])
+    diff = diff_schemas(src, tgt)
+    summary = format_diff_summary(diff)
+    assert "Geänderte/neue Views" in summary and "~ V" in summary
+
+
 # ── Tests: diff_schemas ───────────────────────────────────────────────────────
 
 def test_new_table_detected():
