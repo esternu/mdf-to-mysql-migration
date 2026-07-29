@@ -271,6 +271,82 @@ def _split_top_level_commas(s: str) -> List[str]:
     return parts
 
 
+def extract_view_columns(sql: str) -> List[str]:
+    """Extrahiert die Ausgabe-Spaltennamen aus dem AEUSSERSTEN SELECT einer
+    (bereits nach MySQL konvertierten) View-Definition.
+
+    Wird vom Schema-Diff genutzt, um geaenderte/umbenannte View-Spalten zu
+    erkennen (Spaltensignatur-Vergleich gegen die Live-DB). Der Parser ist
+    klammertiefen- und string-literal-bewusst und kommt mit CTEs (WITH … AS
+    (…) … SELECT) zurecht: der finale, oberste SELECT liefert die Spalten.
+
+    Gibt [] zurueck, wenn die Spaltenliste nicht sicher bestimmt werden kann -
+    der Aufrufer behandelt die View dann als 'geaendert' und erstellt sie neu
+    (sicherer Fallback, da Views datenlos sind).
+    """
+    s = sql.strip().rstrip(";")
+    # Zeilenkommentare entfernen (die WCEP-Views nutzen ----/-- OUTPUT-Trenner)
+    s = re.sub(r'--[^\n]*', '', s)
+
+    # Positionen aller SELECT/FROM auf Klammer-Ebene 0 sammeln
+    depth  = 0
+    in_str = False
+    i, n   = 0, len(s)
+    selects: List[int] = []
+    froms:   List[int] = []
+    while i < n:
+        c = s[i]
+        if in_str:
+            if c == "'":
+                if i + 1 < n and s[i + 1] == "'":
+                    i += 2
+                    continue
+                in_str = False
+            i += 1
+            continue
+        if c == "'":
+            in_str = True
+            i += 1
+            continue
+        if c == '(':
+            depth += 1
+            i += 1
+            continue
+        if c == ')':
+            depth -= 1
+            i += 1
+            continue
+        if depth == 0:
+            m = re.match(r'(SELECT|FROM)\b', s[i:], re.IGNORECASE)
+            if m:
+                (selects if m.group(1).upper() == "SELECT" else froms).append(i)
+                i += len(m.group(1))
+                continue
+        i += 1
+
+    if not selects or not froms:
+        return []
+    sel = selects[-1]                                  # finaler oberster SELECT
+    froms_after = [p for p in froms if p > sel]
+    if not froms_after:
+        return []
+    col_text = s[sel + len("SELECT"):froms_after[0]]
+
+    result: List[str] = []
+    for expr in _split_top_level_commas(col_text):
+        e = expr.strip()
+        if not e:
+            continue
+        # ' AS alias' am Ende? sonst letztes Bezeichner-Token (a.b -> b)
+        m = re.search(r'\bAS\s+(`[^`]+`|"[^"]+"|\[[^\]]+\]|\w+)\s*$', e, re.IGNORECASE | re.DOTALL)
+        if not m:
+            m = re.search(r'(`[^`]+`|"[^"]+"|\[[^\]]+\]|\w+)\s*$', e, re.DOTALL)
+        if not m:
+            return []                                  # unsicher -> neu erstellen
+        result.append(m.group(1).strip('`"[]'))
+    return result
+
+
 def _convert_tsql_convert(sql: str, warnings: List[str]) -> str:
     """T-SQL ``CONVERT(typ, ausdruck)`` → MySQL ``CAST(ausdruck AS typ)``.
 

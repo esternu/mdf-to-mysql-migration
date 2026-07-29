@@ -756,10 +756,11 @@ class App(tk.Tk):
                             for w in diff_result["warnings"]:
                                 self.log(f"  {w}")
 
-                        # Kein Änderungsbedarf?
+                        # Kein Änderungsbedarf? (Tabellen UND Views)
                         no_changes = (
                             not diff_result["new_tables"]
                             and not diff_result["altered_tables"]
+                            and not diff_result.get("changed_views")
                         )
                         if no_changes:
                             self.log("✓ Schema ist bereits aktuell – kein Deploy nötig.")
