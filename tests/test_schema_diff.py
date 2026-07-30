@@ -107,6 +107,42 @@ def test_summary_lists_changed_views():
     assert "Geänderte/neue Views" in summary and "~ V" in summary
 
 
+def test_dependent_view_recreated_when_base_view_changes():
+    # #69 (ViewCosts-1356-Fall): nur die BASIS-View aendert eine Spalte;
+    # die abhaengige View referenziert sie und muss trotzdem neu erstellt
+    # werden, obwohl ihre EIGENE Ausgabesignatur unveraendert ist.
+    src = {"tables": {}, "views": {
+        "dbo.ViewBase": _src_view(
+            "ViewBase", "CREATE VIEW [dbo].[ViewBase] AS SELECT a AS [NewCol] FROM t"),
+        "dbo.ViewDep": _src_view(
+            "ViewDep", "CREATE VIEW [dbo].[ViewDep] AS SELECT [NewCol] AS [D] FROM ViewBase"),
+    }}
+    tgt = {"tables": {}, "views": {
+        "ViewBase": {"columns": ["OldCol"]},   # Basis-Spalte umbenannt
+        "ViewDep":  {"columns": ["D"]},         # eigene Ausgabe unveraendert
+    }}
+    diff = diff_schemas(src, tgt)
+    # Erkannt wird nur die Basis-View (eigene Signatur geaendert)
+    assert [v["name"] for v in diff["changed_views"]] == ["ViewBase"]
+    # ... aber das DDL erstellt BEIDE neu (Konsistenz), Basis zuerst
+    ddl, _ = generate_diff_ddl(diff, src, "testdb")
+    assert "DROP VIEW IF EXISTS `ViewBase`;" in ddl
+    assert "DROP VIEW IF EXISTS `ViewDep`;" in ddl
+    assert ddl.index("CREATE VIEW `ViewBase`") < ddl.index("CREATE VIEW `ViewDep`")
+
+
+def test_no_view_recreation_when_nothing_changed():
+    # Unveraenderte Views -> KEIN DROP/CREATE (Schema-aktuell bleibt intakt)
+    src = {"tables": {}, "views": {
+        "dbo.V": _src_view("V", "SELECT a AS [X] FROM t"),
+    }}
+    tgt = _views_tgt("V", ["X"])
+    diff = diff_schemas(src, tgt)
+    assert diff["changed_views"] == []
+    ddl, _ = generate_diff_ddl(diff, src, "testdb")
+    assert "CREATE VIEW" not in ddl
+
+
 # ── Tests: diff_schemas ───────────────────────────────────────────────────────
 
 def test_new_table_detected():

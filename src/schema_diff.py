@@ -628,13 +628,23 @@ def generate_diff_ddl(
     lines.append("")
     lines.append("SET FOREIGN_KEY_CHECKS = 1;")
 
-    # ── Geänderte/neue Views neu erstellen (datenlos → unkritisch) ────────
-    changed_views = diff.get("changed_views", [])
-    if changed_views:
+    # ── Views neu erstellen (datenlos → unkritisch) ───────────────────────
+    # Sobald EINE View sich aendert, koennen ABHAENGIGE Views brechen, die
+    # eine umbenannte Spalte der geaenderten View referenzieren - auch wenn
+    # ihre eigene Ausgabesignatur gleich blieb (realer Fall: ViewCosts →
+    # ViewResultsArticle → ViewSurfaceArticle, Fehler 1356, siehe #69).
+    # Daher werden ALLE Quell-Views konsistent neu erstellt (topo-sortiert),
+    # sobald changed_views nicht leer ist.
+    if diff.get("changed_views"):
+        all_views = {
+            v["name"]: v
+            for v in source_schema.get("views", {}).values()
+            if v["name"].lower() not in EXCLUDED_VIEWS
+        }
         lines.append("")
-        lines.append("-- Geänderte/neue Views (DROP + CREATE, topologisch sortiert)")
-        views_map = {v["name"]: v for v in changed_views}
-        for vinfo in _topo_sort_views(views_map):
+        lines.append("-- Views neu erstellen (DROP + CREATE, topologisch sortiert; "
+                     "alle Views wegen möglicher Abhängigkeiten)")
+        for vinfo in _topo_sort_views(all_views):
             vname = vinfo["name"]
             vdef, vwarns = convert_view_sql(vinfo["definition"])
             for w in vwarns:
@@ -733,7 +743,8 @@ def format_diff_summary(diff: dict) -> str:
                     )
 
     if diff.get("changed_views"):
-        lines.append(f"  Geänderte/neue Views ({len(diff['changed_views'])}) – werden neu erstellt:")
+        lines.append(f"  Geänderte/neue Views ({len(diff['changed_views'])}) – "
+                     f"alle Views werden zur Konsistenz neu erstellt (Abhängigkeiten):")
         for v in diff["changed_views"]:
             lines.append(f"    ~ {v['name']}")
 
