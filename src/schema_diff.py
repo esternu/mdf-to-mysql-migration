@@ -16,8 +16,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from transform import (convert_type, mssql_name, render_index_ddl, fk_actions_sql,
-                       fk_col_list, convert_view_sql, extract_view_columns,
-                       EXCLUDED_VIEWS)
+                       fk_col_list, convert_view_sql, EXCLUDED_VIEWS)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -355,24 +354,17 @@ def diff_schemas(source: dict, target_mysql: dict) -> dict:
         if any(changes.values()):
             diff["altered_tables"][tbl_name] = changes
 
-    # ── Views vergleichen (Spaltensignatur) ───────────────────────────────
-    # Views werden im MySQL-Diff sonst gar nicht betrachtet. Hier: pro
-    # Quell-View die Ausgabespalten (aus dem konvertierten CREATE VIEW)
-    # gegen die Live-Spalten stellen. Weicht etwas ab (oder View fehlt in
-    # MySQL, oder Parser unsicher), wird sie neu erstellt. Unveraenderte
-    # Views bleiben unberuehrt (der "Schema aktuell"-Kurzschluss haelt).
-    tgt_views = {k.lower(): v for k, v in target_mysql.get("views", {}).items()}
+    # ── Views: IMMER neu erstellen (datenlos → unkritisch) ────────────────
+    # Ein Spalten-SIGNATUR-Vergleich (Namen/Reihenfolge) ist fuer Views zu
+    # schwach: er verpasst reine LOGIK-Aenderungen bei gleichbleibenden
+    # Spalten (z.B. `concat(x, …)` → schlichtes `x`, Typ/Wert aendern sich,
+    # der Name nicht) → falsches "Schema aktuell", Aenderung erreicht die
+    # Live-DB nie (siehe #71). Views haben keine Daten, DROP+CREATE ist
+    # idempotent und kann keine Aenderung uebersehen. Darum werden alle
+    # Quell-Views bei jedem Deploy neu erstellt (topo-sortiert in
+    # generate_diff_ddl). ViewAuditChanges ist ausgeschlossen.
     for vinfo in source.get("views", {}).values():
-        vname = vinfo["name"]
-        if vname.lower() in EXCLUDED_VIEWS:
-            continue
-        converted, _ = convert_view_sql(vinfo["definition"])
-        src_cols = extract_view_columns(converted)
-        tgt = tgt_views.get(vname.lower())
-        tgt_cols = tgt["columns"] if tgt else None
-        if (tgt_cols is None
-                or not src_cols                       # Parser unsicher -> neu
-                or [c.lower() for c in src_cols] != [c.lower() for c in tgt_cols]):
+        if vinfo["name"].lower() not in EXCLUDED_VIEWS:
             diff["changed_views"].append(vinfo)
 
     return diff
@@ -743,8 +735,8 @@ def format_diff_summary(diff: dict) -> str:
                     )
 
     if diff.get("changed_views"):
-        lines.append(f"  Geänderte/neue Views ({len(diff['changed_views'])}) – "
-                     f"alle Views werden zur Konsistenz neu erstellt (Abhängigkeiten):")
+        lines.append(f"  Views ({len(diff['changed_views'])}) – werden neu erstellt "
+                     f"(datenlos; Logikänderungen sonst nicht erkennbar):")
         for v in diff["changed_views"]:
             lines.append(f"    ~ {v['name']}")
 

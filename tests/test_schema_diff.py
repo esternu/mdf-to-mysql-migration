@@ -68,11 +68,14 @@ def test_view_column_rename_detected():
     assert [v["name"] for v in diff["changed_views"]] == ["V"]
 
 
-def test_view_identical_columns_no_change():
+def test_view_always_recreated_even_if_columns_identical():
+    # #71: identische Spalten -> Signatur-Vergleich saehe "keine Aenderung",
+    # aber Logikaenderungen (gleiche Spalten) waeren unsichtbar. Darum wird
+    # jede Quell-View immer neu erstellt.
     src = _views_src("V", "SELECT a AS [Col1], b AS [Col2] FROM t")
     tgt = _views_tgt("V", ["Col1", "Col2"])
     diff = diff_schemas(src, tgt)
-    assert diff["changed_views"] == []
+    assert [v["name"] for v in diff["changed_views"]] == ["V"]
 
 
 def test_new_view_not_in_mysql_is_changed():
@@ -104,7 +107,7 @@ def test_summary_lists_changed_views():
     tgt = _views_tgt("V", ["Y"])
     diff = diff_schemas(src, tgt)
     summary = format_diff_summary(diff)
-    assert "Geänderte/neue Views" in summary and "~ V" in summary
+    assert "Views" in summary and "werden neu erstellt" in summary and "~ V" in summary
 
 
 def test_dependent_view_recreated_when_base_view_changes():
@@ -122,20 +125,18 @@ def test_dependent_view_recreated_when_base_view_changes():
         "ViewDep":  {"columns": ["D"]},         # eigene Ausgabe unveraendert
     }}
     diff = diff_schemas(src, tgt)
-    # Erkannt wird nur die Basis-View (eigene Signatur geaendert)
-    assert [v["name"] for v in diff["changed_views"]] == ["ViewBase"]
-    # ... aber das DDL erstellt BEIDE neu (Konsistenz), Basis zuerst
+    # #71: ALLE Quell-Views werden neu erstellt (nicht nur die "geaenderte")
+    assert set(v["name"] for v in diff["changed_views"]) == {"ViewBase", "ViewDep"}
+    # DDL erstellt beide neu, Basis zuerst (topo-sortiert)
     ddl, _ = generate_diff_ddl(diff, src, "testdb")
     assert "DROP VIEW IF EXISTS `ViewBase`;" in ddl
     assert "DROP VIEW IF EXISTS `ViewDep`;" in ddl
     assert ddl.index("CREATE VIEW `ViewBase`") < ddl.index("CREATE VIEW `ViewDep`")
 
 
-def test_no_view_recreation_when_nothing_changed():
-    # Unveraenderte Views -> KEIN DROP/CREATE (Schema-aktuell bleibt intakt)
-    src = {"tables": {}, "views": {
-        "dbo.V": _src_view("V", "SELECT a AS [X] FROM t"),
-    }}
+def test_no_view_recreation_when_no_source_views():
+    # Ohne Quell-Views wird auch nichts erstellt (leeres changed_views).
+    src = {"tables": {}, "views": {}}
     tgt = _views_tgt("V", ["X"])
     diff = diff_schemas(src, tgt)
     assert diff["changed_views"] == []
